@@ -1,0 +1,92 @@
+@startuml
+!theme plain
+skinparam linetype ortho
+skinparam nodesep 50
+skinparam ranksep 60
+skinparam padding 5
+skinparam node {
+  BackgroundColor #FFFFFF
+  BorderColor     #3B82F6
+}
+skinparam cloud {
+  BackgroundColor #F8FAFC
+  BorderColor     #94A3B8
+}
+skinparam database {
+  BackgroundColor #F0FDF4
+  BorderColor     #22C55E
+}
+skinparam component {
+  BackgroundColor #EFF6FF
+  BorderColor     #2563EB
+}
+
+title Deployment Diagram: PetCare SaaS 混合部署架構（開發/MVP 階段）
+
+actor "Client User\n（飼主/員工/店長）" as Client_User
+
+' ─── 雲端環境 ───
+cloud "Public Internet（外部網路）" {
+
+  cloud "Vercel / Netlify" <<Free Hosting>> {
+    component "Static Web Server\n（託管 React SPA）" as Vercel
+  }
+
+  cloud "Ngrok / Cloudflare Tunnel" <<Tunneling Service>> {
+    component "Public HTTPS Endpoint\n（公開安全網址）" as TunnelGateway
+    note right of TunnelGateway
+      ⚠️ 僅限開發/測試環境使用
+      生產環境應替換為：
+      正式域名 + SSL 憑證 + 雲端部署
+    end note
+  }
+
+  cloud "External Services（第三方服務）" {
+    node "Payment Gateway\n（綠界/LINE Pay）" as ExtPay
+    node "Notification Provider\n（Twilio/FCM）" as ExtNotif
+  }
+}
+
+' ─── 本地端環境 ───
+node "Developer's Laptop / Local Server（本地主機 127.0.0.1）" {
+
+  component "Tunnel Agent\n（ngrok / cloudflared）" as Agent
+  note left of Agent : 維持與雲端 Tunnel 的\n安全加密連線
+
+  node "IDE / Backend Environment" {
+    component "PetCare Backend API\n（Python FastAPI Modular Monolith / Port: 8000）" as API
+    component "Job Scheduler\n（內嵌非同步排程 / Port: 8001）" as Scheduler
+
+    note right of API
+      開發階段採用 Modular Monolith
+      模組邊界與 Component Diagram 一致
+      生產上線前可逐步拆分為微服務
+    end note
+  }
+
+  node "Docker Desktop / Compose" <<Containerized>> {
+    database "PostgreSQL\n（業務資料庫）" as DB
+    database "Redis\n（快取與 JWT 黑名單）" as Redis
+  }
+}
+
+' ─── 流量動線 ───
+Client_User --> Vercel        : 1. 請求載入網頁 (HTTPS)
+Client_User --> TunnelGateway : 2. 發起 API 請求 (REST/HTTPS)
+TunnelGateway ==> Agent       : 3. 流量穿透 (Secure Tunnel)
+Agent --> API                 : 4. 轉發至本地 (HTTP/8000)
+API --> DB                    : 5. 讀寫業務資料 (SQLAlchemy)
+API --> Redis                 : 6. 讀寫快取與鎖 (TCP)
+API --> ExtPay                : 7. 金流授權請求 (HTTPS)
+API --> ExtNotif              : 8. 發送通知 (HTTPS)
+Scheduler --> API             : 定時觸發排程任務
+
+note as ProductionNote
+  生產環境升級路徑:
+  Vercel Frontend  → 保留（依賴 Edge CDN）
+  Ngrok Tunnel     → 替換為 AWS/GCP Load Balancer
+  FastAPI Monolith → 拆分為 Kubernetes 容器微服務
+  Docker Desktop   → 替換為雲端託管 RDS + ElastiCache
+end note
+
+@enduml

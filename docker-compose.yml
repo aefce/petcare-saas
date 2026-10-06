@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: petcare_db
+    environment:
+      POSTGRES_USER: petcare_user
+      POSTGRES_PASSWORD: petcare_password
+      POSTGRES_DB: petcare_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: petcare_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+
+  celery_worker:
+    image: python:3.11-slim
+    container_name: petcare_celery_worker
+    volumes:
+      - ./backend:/app
+    working_dir: /app
+    environment:
+      DATABASE_URL: postgresql://petcare_user:petcare_password@db:5432/petcare_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    command: sh -c "pip install -r requirements.txt && celery -A src.core.celery_app worker --loglevel=info"
+    depends_on:
+      - redis
+      - db
+
+volumes:
+  postgres_data:
+  redis_data:

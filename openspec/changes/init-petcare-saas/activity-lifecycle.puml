@@ -1,0 +1,99 @@
+@startuml
+title 寵物旅館與美容系統 (PetCare SaaS) - 核心業務生命週期活動圖
+
+skinparam activity {
+  BackgroundColor White
+  BorderColor #2c3e50
+  ArrowColor #2c3e50
+  FontSize 12
+}
+skinparam swimlaneBorderColor Black
+
+' 劃分四大泳道
+|#E1F5FE|飼主 (Pet Owner)|
+|#FFF3E0|櫃檯 (Reception)|
+|#FFEBCA|系統與金流 (System & API)|
+|#E8F5E9|後勤團隊 (Caregiver / Groomer)|
+
+|飼主 (Pet Owner)|
+start
+:選擇服務 (住宿/美容) 與時段;
+
+|系統與金流 (System & API)|
+if (資源檢查與 15min TTL 鎖定?) then (失敗)
+  :通知預約額滿或時段衝突;
+  stop
+else (成功)
+  |飼主 (Pet Owner)|
+  :確認訂單並線上付款;
+
+  |系統與金流 (System & API)|
+  :呼叫金流 API (冪等性校驗);
+  if (付款成功?) then (否)
+    :釋放資源鎖定 (Release TTL);
+    stop
+  else (是)
+    :建立訂單並正式扣留資源;
+    :發送預約確認通知;
+  endif
+endif
+
+|飼主 (Pet Owner)|
+:預約日當天抵達門店;
+
+|櫃檯 (Reception)|
+:掃描寵物晶片與確認身分;
+
+|系統與金流 (System & API)|
+if (健康/疫苗過期 或 UR-05 兇猛警示?) then (有異常)
+  |櫃檯 (Reception)|
+  :啟動風險防護流程;
+  if (可否隔離收容?) then (否)
+    :拒絕服務並啟動退款;
+    stop
+  else (是)
+    :簽署免責聲明與安排隔離區;
+  endif
+else (正常)
+endif
+
+|系統與金流 (System & API)|
+:更新狀態為 Checked-in;
+:自動派發工作任務卡 (Task Cards);
+
+|後勤團隊 (Caregiver / Groomer)|
+:接收工作單並檢視警示標籤;
+
+split
+  ' 住宿照護分支
+  repeat
+    :日常餵食、清潔與放風;
+    |系統與金流 (System & API)|
+    :寫入健康與排泄狀況紀錄;
+  |後勤團隊 (Caregiver / Groomer)|
+  repeat while (住宿期結束?) is (否)
+  -> 是;
+split again
+  ' 美容分支
+  if (包含美容服務?) then (是)
+    :執行洗澡與造型修剪;
+    |系統與金流 (System & API)|
+    :上傳美容前後對比照片;
+  |後勤團隊 (Caregiver / Groomer)|
+  else (否)
+  endif
+end split
+
+:點擊「任務完成 (Completed)」;
+
+|系統與金流 (System & API)|
+:結算最終帳單 (包含逾時或加購);
+:發送取寵通知與照片給飼主;
+
+|櫃檯 (Reception)|
+:確認最終結帳與歸還寵物;
+
+|飼主 (Pet Owner)|
+:領回寵物並留下評價;
+stop
+@enduml

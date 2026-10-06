@@ -1,0 +1,512 @@
+@startuml ClassDiagram_Final_v2
+!theme plain
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+skinparam nodesep 60
+skinparam ranksep 80
+
+' ==========================================
+' Identity & Access
+' ==========================================
+
+abstract class Account {
+    # accountId    : UUID
+    # email        : String
+    # passwordHash : String
+    # isActive     : Boolean
+    # createdAt    : DateTime
+    # updatedAt    : DateTime
+    --
+    + verifyPassword(input: String) : Boolean
+    + getAccountId() : UUID
+    + deactivate() : Void
+}
+
+class StaffAccount {
+    - employeeId  : String
+    - role        : RoleEnum
+    - permissions : List<String>
+    - hiredAt     : Date
+    --
+    + updatePermissions(newList) : Void
+}
+
+class MemberAccount {
+    - phone            : String
+    - ThirdPartyToken  : String
+    - preferredChannel : String
+    --
+    + linkThirdParty(provider: String) : Void
+}
+
+abstract class PetOwner {
+    # ownerId    : UUID
+    # name       : String
+    # phone      : String
+    # createdAt  : DateTime
+    # updatedAt  : DateTime
+    --
+    + updateContactInfo(newPhone: String) : Void
+    + getOwnerId() : UUID
+}
+
+class Member {
+    - accountId   : UUID
+    - memberSince : Date
+    --
+    + getOrderHistory() : List<Order>
+}
+
+class Guest {
+    - expireAt    : DateTime
+    - visitSource : Enum
+    --
+    + convertToMember(accountId: UUID) : Member
+}
+
+abstract class Staff {
+    - staffId    : UUID
+    - accountId  : UUID
+    - name       : String
+    - phone      : String
+    - createdAt  : DateTime
+    - updatedAt  : DateTime
+    --
+    + updateContactInfo(newPhone: String) : Void
+    + getAssignedTasks(workDate: Date) : List<ServiceTask>
+    + getPersonalFeedbacks(startDate: Date, endDate: Date) : List<Feedback>
+    + calculateAverageRating(startDate: Date, endDate: Date) : Float
+}
+
+class Groomer {
+    - specialization : String
+    - avgRating      : Float
+    - certification  : String
+    --
+    + acceptTask(taskId) : Boolean
+    + uploadBeforeAfter() : Void
+    + completeGrooming() : Void
+}
+
+class Caregiver {
+    - shiftType        : Enum
+    - assignedRooms    : List<UUID>
+    - medicalKnowledge : Boolean
+    --
+    + logFeeding(petId) : Void
+    + performHealthCheck() : Boolean
+    + reportIncident() : Void
+}
+
+class Receptionist {
+    - counterNo   : String
+    - shiftPeriod : String
+    --
+    + checkInPet(petId) : CheckInRecord
+    + processPayment(orderId) : PaymentTransaction
+    + handleWalkIn(petOwner) : Order
+    + verifyVaccine(petId) : Boolean
+}
+
+class Manager {
+    - authLevel      : Integer
+    - departmentName : String
+    --
+    + approveRefundRequest(cancelId: UUID) : Boolean
+    + updateStaffSchedule(staffId: UUID) : Void
+    + exportBusinessReport(period: String) : File
+}
+
+class Admin {
+    - rootAccessLevel : Integer
+    - systemLogPath   : String
+    --
+    + configureSystemSettings() : Void
+    + manageUserAccounts(accId: UUID) : Void
+    + backupDatabase() : Boolean
+}
+
+' ==========================================
+' Core Entities
+' ==========================================
+
+class Pet {
+    - petId        : UUID
+    - ownerId      : UUID
+    - name         : String
+    - breed        : String
+    - species      : Enum(DOG, CAT)
+    - isAggressive : Boolean
+    - weight       : Float
+    - microchipId  : String
+    - createdAt    : DateTime
+    - updatedAt    : DateTime
+    --
+    + getOwnerId() : UUID
+    + getPetId() : UUID
+    + updateWeight(newWeight: Float) : Void
+    + flagAsAggressive() : Void
+    + hasValidVaccine(checkDate: Date) : Boolean
+    + addVaccineRecord(name: String, expireDate: Date) : Void
+}
+
+class VaccineRecord {
+    - recordId    : UUID
+    - petId       : UUID
+    - vaccineName : String
+    - expireDate  : Date
+    - documentUrl : String
+    --
+    + isValidAt(targetDate: Date) : Boolean
+}
+
+class Booking {
+    - bookingId      : UUID
+    - memberId       : UUID
+    - status         : Enum(PENDING, CONFIRMED, CANCELLED, EXPIRED)
+    - lockedUntil    : DateTime
+    - specialRequest : String
+    - createdAt      : DateTime
+    - updatedAt      : DateTime
+    --
+    + getBookingId() : UUID
+    + addBookingItem(petId, roomId, timeslotId, catalogId, price) : Void
+    + isExpired(currentTime: DateTime) : Boolean
+    + confirm() : Void
+}
+
+class BookingItem {
+    - bookingItemId   : UUID
+    - bookingId       : UUID
+    - petId           : UUID
+    - roomId          : UUID
+    - timeslotId      : UUID
+    - serviceCatalogId: UUID
+    - itemType        : Enum(BOARDING, GROOMING, COMBINED)
+    - unitPrice       : Integer
+    - note            : String
+    --
+    + getPetId() : UUID
+    + getOccupiedResources() : List<UUID>
+}
+
+class Order {
+    - orderId      : UUID
+    - bookingId    : UUID
+    - totalAmount  : Integer
+    - discountType : Enum(MANUAL, PROMO_CODE, NONE)
+    - discountNote : String
+    - status       : Enum(PENDING_PAYMENT, PAID, PARTIALLY_REFUNDED, FULLY_REFUNDED)
+    - createdAt    : DateTime
+    - updatedAt    : DateTime
+    --
+    + getOrderId() : UUID
+    + applyManualDiscount(amount: Integer, reason: String) : Void
+    + markAsPaid() : Void
+}
+
+class PaymentTransaction {
+    - transactionId : UUID
+    - orderId       : UUID
+    - gatewayRefId  : String
+    - paymentMethod : Enum(CREDIT_CARD, LINE_PAY, CASH)
+    - amount        : Integer
+    - status        : Enum(PENDING_PAYMENT, PAID, PARTIALLY_REFUNDED, FULLY_REFUNDED)
+    - errorMessage  : String
+    - createdAt     : DateTime
+    --
+    + recordSuccess(gatewayId: String) : Void
+    + recordFailure(errorMsg: String) : Void
+}
+
+class Room {
+    - roomId     : UUID
+    - roomNumber : String
+    - roomType   : Enum(STANDARD, LUXURY, CAT_CABIN)
+    - dailyRate  : Integer
+    - status     : Enum(AVAILABLE, LOCKED, BOOKED, BLOCKED)
+    - notes      : String
+    - createdAt  : DateTime
+    - updatedAt  : DateTime
+    --
+    + getRoomId() : UUID
+    + updateDailyRate(newRate: Integer) : Void
+    + markAsMaintenance(reason: String) : Void
+    + releaseRoom() : Void
+}
+
+class Schedule {
+    - scheduleId : UUID
+    - staffId    : UUID
+    - workDate   : Date
+    - startTime  : Time
+    - endTime    : Time
+    - shiftType  : Enum(MORNING, AFTERNOON, FULL_DAY)
+    --
+    + getScheduleId() : UUID
+    + getStaffId() : UUID
+    + generateTimeslots(interval: Integer) : List<Timeslot>
+}
+
+class Timeslot {
+    - timeslotId : UUID
+    - staffId    : UUID
+    - workDate   : Date
+    - startTime  : Time
+    - endTime    : Time
+    - isBooked   : Boolean
+    - createdAt  : DateTime
+    - updatedAt  : DateTime
+    --
+    + getTimeslotId() : UUID
+    + isAvailable() : Boolean
+    + lockSlot() : Void
+    + releaseSlot() : Void
+}
+
+class EmployeeCalendar {
+    - calendarId  : UUID
+    - staffId     : UUID
+    - date        : Date
+    - isAvailable : Boolean
+    - workStatus  : Enum(ON_DUTY, OFF_DUTY, LEAVE)
+    --
+    + getCalendarId() : UUID
+    + toggleAvailability(status: Boolean) : Void
+    + getDailyOverview() : Map<Time, Task>
+}
+
+class ServiceCatalog {
+    - catalogId       : UUID
+    - serviceName     : String
+    - category        : Enum(BOARDING, GROOMING, DAYCARE)
+    - basePrice       : Integer
+    - durationMinutes : Integer
+    - description     : String
+    - isActive        : Boolean
+    --
+    + getCatalogId() : UUID
+    + updatePrice(newPrice: Integer) : Void
+    + calculateFinalPrice(modifiers: List) : Integer
+}
+
+class ServiceTask {
+    - taskId        : UUID
+    - bookingItemId : UUID
+    - staffId       : UUID
+    - status        : Enum(PENDING, ONGOING, COMPLETED)
+    - startTime     : DateTime
+    - endTime       : DateTime
+    - workerNote    : String
+    --
+    + getTaskId() : UUID
+    + assignTo(staffId: UUID) : Void
+    + startTask() : Void
+    + completeTask(note: String) : Void
+}
+
+' ==========================================
+' Operations
+' ==========================================
+
+class CheckInRecord {
+    - checkInId      : UUID
+    - orderId        : UUID
+    - petId          : UUID
+    - actualCheckIn  : DateTime
+    - actualCheckOut : DateTime
+    - status         : Enum(CHECKED_IN, CHECKED_OUT)
+    --
+    + getCheckInId() : UUID
+    + processCheckIn() : Void
+    + processCheckOut() : Void
+}
+
+class CancellationRequest {
+    - cancellationId : UUID
+    - orderId        : UUID
+    - reason         : String
+    - status         : Enum(PENDING, APPROVED, REJECTED)
+    - feeCharged     : Integer
+    - createdAt      : DateTime
+    --
+    + getCancellationId() : UUID
+    + approveCancellation(adminId: UUID) : Void
+    + rejectCancellation(reason: String) : Void
+}
+
+class RefundRequest {
+    - refundId      : UUID
+    - orderId       : UUID
+    - requestedById : UUID
+    - reviewedById  : UUID
+    - refundAmount  : Integer
+    - reason        : String
+    - status        : Enum(PENDING, APPROVED, REJECTED)
+    - rejectReason  : String
+    --
+    + approve(reviewerId: UUID) : Void
+    + reject(reviewerId: UUID, reason: String) : Void
+}
+
+class Notification {
+    - notificationId : UUID
+    - accountId      : UUID
+    - type           : Enum(SYSTEM, PROMO, REMINDER, EMERGENCY)
+    - title          : String
+    - content        : String
+    - isRead         : Boolean
+    - sentAt         : DateTime
+    --
+    + getNotificationId() : UUID
+    + markAsRead() : Void
+}
+
+class Feedback {
+    - feedbackId    : UUID
+    - orderId       : UUID
+    - targetStaffId : UUID
+    - rating        : Integer
+    - comment       : String
+    - storeReply    : String
+    - createdAt     : DateTime
+    - repliedAt     : DateTime
+    --
+    + getFeedbackId() : UUID
+    + getTargetStaffId() : UUID
+    + updateComment(newComment: String) : Void
+    + replyByManager(replyMsg: String) : Void
+}
+
+' ==========================================
+' Business Services
+' ==========================================
+
+class MemberService {
+    - identityVerifier : IdentityEngine
+    --
+    + getProfile(memberId: UUID) : MemberProfileDTO
+    + updateProfile(memberId: UUID, data: ProfileDTO) : Boolean
+    + verifyIdentity(phone: String, email: String) : Boolean
+    + convertToMember(guestId: UUID, accountData: AccountDTO) : Member
+}
+
+class BookingService {
+    --
+    + checkAvailability(type: Enum, date: Date) : List<Resource>
+    + createBooking(memberId: UUID, items: List) : Booking
+    + calculateRefund(cancellationId: UUID) : Integer
+    + processCancellation(bookingId: UUID) : Boolean
+}
+
+class ExecutionService {
+    --
+    + handleWalkIn(ownerId: UUID, serviceId: UUID) : Order
+    + verifyPetHealth(petId: UUID) : Boolean
+    + dispatchTask(bookingItemId: UUID) : ServiceTask
+    + completeExecution(taskId: UUID, note: String) : Void
+}
+
+class GroomingService {
+    --
+    + startExecution(taskId: UUID) : Void
+    + updateTaskProgress(taskId: UUID, status: Enum) : Void
+    + finalizeService(taskId: UUID) : Void
+    - internalTaskValidation(taskId: UUID) : Boolean
+}
+
+class CancellationService {
+    --
+    + validateCancellationPolicy(cancelId: UUID) : Boolean
+    + calculateRefundAmount(cancelId: UUID) : Integer
+    + executeRefundFlow(refundId: UUID) : Boolean
+    - calculateLateFee(bookingTime: DateTime) : Integer
+}
+
+class NotificationService {
+    --
+    + dispatchNotification(accId: UUID, content: String) : Void
+    + getNotificationHistory(accId: UUID) : List<Notification>
+    # resolveRecipientChannel(accId: UUID) : Enum
+}
+
+' ==========================================
+' Relationships
+' ==========================================
+
+' --- 繼承 ---
+Account  <|-- StaffAccount
+Account  <|-- MemberAccount
+PetOwner <|-- Member
+PetOwner <|-- Guest
+Staff    <|-- Groomer
+Staff    <|-- Caregiver
+Staff    <|-- Receptionist
+Staff    <|-- Manager
+Staff    <|-- Admin
+
+' --- 帳號一對一 ---
+Member "1" -- "1" MemberAccount : 擁有帳號 >
+Staff  "1" -- "1" StaffAccount  : 擁有帳號 >
+
+' --- Composition ---
+Pet      "1" *-- "0..*" VaccineRecord      : 擁有 >
+Booking  "1" *-- "1..*" BookingItem        : 包含 >
+Schedule "1" *-- "1..*" Timeslot           : 產生 >
+Order    "1" *-- "0..*" PaymentTransaction : 產生交易 >
+
+' --- Association ---
+Member   "1"    --> "0..*" Booking       : 發起預約 >
+Booking  "0..*" --> "1"    Timeslot      : 鎖定時段 >
+Booking  "1"    --> "1"    Order         : 轉換訂單 >
+PetOwner "1"    --> "0..*" Order         : 現場交易 >
+
+Order       "1"    --> "1..*" BookingItem    : 引用 >
+BookingItem "0..*" --> "1"    Pet            : 服務對象 >
+BookingItem "0..*" --> "0..1" Room           : 佔用 >
+BookingItem "0..*" --> "1"    ServiceCatalog : 定義參考 >
+
+ServiceCatalog "1"    --> "0..*" ServiceTask : 規範 >
+ServiceTask    "0..*" --> "1"    BookingItem : 執行來源 >
+ServiceTask    "0..*" --> "1"    Staff       : 執行員工 >
+
+Order         "1"    --> "0..1" CheckInRecord       : 觸發報到 >
+CheckInRecord "0..*" --> "1"    Pet                 : 驗證寵物 >
+CheckInRecord "0..*" --> "1"    Receptionist        : 由櫃台執行 >
+
+CancellationRequest "0..*" --> "1"    Order               : 申請終止 >
+Manager             "1"    --> "0..*" CancellationRequest : 審核 >
+Manager             "1"    --> "0..*" Staff               : 管理 >
+Order               "1"    --> "0..1" RefundRequest       : 產生退款 >
+
+Staff        "1"    --> "0..*" Schedule         : 負責排班 >
+Staff        "1"    --> "1"    EmployeeCalendar : 擁有行事曆 >
+
+Notification "0..*" --> "1"    Account : 發送通知 >
+Feedback     "0..*" --> "1"    Order   : 評價交易 >
+Feedback     "0..*" --> "0..1" Staff   : 評價員工 >
+
+' --- Service Layer Dependency ---
+MemberService       ..> Member              : "Profile"
+MemberService       ..> Account             : "Auth"
+MemberService       ..> Guest               : "Temp Check"
+
+BookingService      ..> Booking             : "Create & TTL"
+BookingService      ..> Order               : "Payment"
+BookingService      ..> Timeslot            : "Lock Check"
+BookingService      ..> Notification        : "Confirm"
+
+ExecutionService    ..> Order               : "Walk-in"
+ExecutionService    ..> CheckInRecord       : "Check-in"
+ExecutionService    ..> Pet                 : "Health Check"
+
+GroomingService     ..> ServiceTask         : "Execution"
+GroomingService     ..> Notification        : "Updates"
+
+CancellationService ..> CancellationRequest : "Validate"
+CancellationService ..> RefundRequest       : "Calculate"
+
+NotificationService ..> Notification        : "Dispatch"
+NotificationService ..> Account             : "Resolver"
+
+@enduml

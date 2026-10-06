@@ -1,0 +1,730 @@
+@startuml
+!theme plain
+autonumber
+
+actor "Staff" as S
+boundary "Management UI" as UI
+control "StaffService" as SS
+control "AuthService (JWT Provider)" as Auth
+database "AccountDB" as DB
+participant "Redis (Session Store)" as Redis
+
+== 1. 驗證與簽發 ==
+S -> UI : 輸入密碼
+UI -> SS : login(email, password)
+activate SS
+
+SS -> DB : findStaff(email)
+DB --> SS : {id, pwdHash, role, permissions}
+
+' 業界標準：Bcrypt 驗證
+SS -> SS : bcrypt.verify(password, pwdHash)
+
+alt #HoneyDew 驗證通過
+    SS -> Auth : **generateJWT(staffId, role)**
+    activate Auth
+    note right: 包含數位簽名，防止竄改
+    Auth --> SS : {accessToken, refreshToken}
+    deactivate Auth
+
+    ' 業界標準：存入 Redis 實現「主動失效」能力
+    SS -> Redis : set(key=token, value=staffInfo, TTL=8h)
+    
+    SS --> UI : **Return JWT (HttpOnly Cookie 建議)**
+    UI --> S : 登入成功，依權限跳轉
+    
+else #MistyRose 驗證失敗
+    SS --> UI : Error 401: "Invalid Credentials"
+end
+
+deactivate SS
+
+@enduml
+
+@startuml
+!theme plain
+autonumber
+
+actor "Member" as U
+boundary "Booking UI" as UI
+control "BookingService" as S
+database "ScheduleRepository" as DB
+participant "CacheManager\n(Redis/Timer)" as Timer
+control "NotificationService" as NS
+
+== 0. 前置：查詢可用時段 (含過期自癒) ==
+U -> UI : 選擇日期與服務類型
+UI -> S : getAvailableSlots(date, type)
+' 修正：撈出 AVAILABLE 或 已過期但仍被鎖定的位子
+S -> DB : findSlots(status='AVAILABLE' OR \n(status='LOCKED' AND lockedUntil < now))
+DB --> S : List<Timeslot>
+S --> UI : 顯示可用時段列表
+
+== 1. 原子性鎖定 (避免搶單衝突) ==
+U -> UI : 選擇時段 (slotId)
+UI -> S : attemptLock(memberId, slotId)
+activate S
+
+' 防惡意：檢查該會員是否已有 PENDING 訂單
+S -> DB : countActiveLocks(memberId)
+DB --> S : lockCount
+
+alt #HoneyDew 允許鎖定 (lockCount < 限制)
+    ' 啟動 DB 事務
+    S -> DB : **START TRANSACTION**
+    
+    ' 關鍵：原子更新語法
+    S -> DB : updateStatusToLocked(slotId, now+15m)\n[WHERE status='AVAILABLE' OR lockedUntil < now]
+    activate DB
+    DB --> S : affectedRows (1=成功, 0=失敗)
+    
+    alt #HoneyDew 鎖定成功
+        S -> DB : createBooking(memberId, slotId, status=PENDING)
+        S -> DB : **COMMIT**
+        deactivate DB
+        
+        ' 啟動 Plan B 主動失效鬧鐘
+        S -> Timer : setExpiration(bookingId, 900s)
+        activate Timer
+        Timer --> S : ack
+        deactivate Timer
+
+        S --> UI : {bookingId, lockedUntil}
+        UI -> UI : 啟動 15:00 倒數
+        
+    else #MistyRose 鎖定失敗 (剛被搶走)
+        S -> DB : **ROLLBACK**
+        S --> UI : Error 409: "該時段已被搶先預訂"
+    end
+    
+else #MistyRose 達鎖定上限
+    S --> UI : Error 429: "您已有保留中的預約，請先完成結帳"
+end
+deactivate S
+
+== 2. Plan B: 超時主動釋放 (非同步) ==
+Timer ->> S : [Async] onExpired(bookingId)
+activate S
+S -> DB : getBookingStatus(bookingId)
+alt #GhostWhite 仍未付款
+    S -> DB : releaseSlot(slotId, status=AVAILABLE)
+    S -> DB : updateBooking(status=EXPIRED)
+    S -> NS : sendNotice("您的預約已失效")
+end
+deactivate S
+@enduml
+
+@startuml
+!theme plain
+autonumber
+
+actor "Member" as U
+boundary "Booking UI" as UI
+participant "Payment Gateway\n(綠界/LinePay)" as PG
+control "BookingService" as S
+database "ScheduleDB" as DB
+participant "CacheManager\n(Timer)" as Timer
+control "NotificationService" as NS
+
+== 1. 發起支付 (轉交控制權) ==
+U -> UI : 點擊 [確認預約並前往付款]
+UI -> S : initiatePayment(bookingId)
+activate S
+S -> DB : getBookingDetails(bookingId)
+' 將訂單資訊轉化為金流商要求的格式
+S -> PG : 建立交易單 (amount, orderId, returnUrl, webhookUrl)
+PG --> S : paymentUrl (第三方支付連結)
+S --> UI : 重導向至金流頁面
+deactivate S
+
+note over U, PG : 使用者在第三方頁面輸入信用卡並授權成功
+
+== 2. 非同步 Webhook 回傳 (核心救贖機制) ==
+PG ->> S : [Async POST] Webhook: 支付成功通知
+activate S
+
+' 業界標準：防偽造驗證
+S -> S : verifySignature(payload, hashString)
+alt #MistyRose 簽名驗證失敗 (疑似偽造或被竄改)
+    S --> PG : 403 Forbidden
+else #HoneyDew 簽名合法
+    
+    ' 業界標準：排他鎖與冪等性檢查 (防重複回傳)
+    S -> DB : **START TRANSACTION**
+    S -> DB : lockBookingForUpdate(bookingId)\n[SELECT ... FOR UPDATE]
+    DB --> S : Booking Entity
+    
+    alt #LightGray 訂單已是 CONFIRMED (代表之前處理過了)
+        S -> DB : **ROLLBACK**
+        S --> PG : HTTP 200 OK (告訴金流商別再發了)
+    else #HoneyDew 訂單為 PENDING (首次處理)
+        ' 正式成交：改變訂單與資源的法律地位
+        S -> DB : updateBookingStatus(CONFIRMED, paymentId)
+        S -> DB : updateTimeslotStatus(OCCUPIED)
+        S -> DB : **COMMIT**
+        
+        ' --- 關鍵：殺掉 SD-01 的自毀鬧鐘 ---
+        S -> Timer : **cancelExpiration(bookingId)**
+        activate Timer
+        Timer --> S : ack (鬧鐘已解除)
+        deactivate Timer
+        
+        S -> NS : sendSuccessNotice(memberId, receipt)
+        S --> PG : HTTP 200 OK (成功接收)
+    end
+end
+deactivate S
+
+== 3. 使用者返回系統 (Frontend Polling) ==
+PG --> U : 導回 returnUrl (我們的系統)
+U -> UI : 載入預約成功頁面
+UI -> S : getBookingStatus(bookingId)
+S --> UI : {status: 'CONFIRMED'}
+UI --> U : 顯示預約成功與電子票證
+@enduml
+
+@startuml
+!theme plain
+autonumber
+
+actor "Receptionist" as R
+boundary "Staff UI" as UI
+control "ExecutionService" as ES
+participant "Redis (Auth)" as Cache
+database "SystemDB" as DB
+control "NotificationService" as NS
+
+== 1. 查詢與資格審查 (含安全驗證) ==
+R -> UI : 輸入訂單號碼或手機
+UI -> ES : getOrderForCheckIn(query, JWT)
+activate ES
+
+' 業界標準：先驗證員工身分與權限
+ES -> Cache : validateToken(JWT, requiredRole='STAFF')
+Cache --> ES : {staffId, isValid}
+
+alt #MistyRose Token 無效或權限不足
+    ES --> UI : Error 401/403: "未授權的操作"
+else #HoneyDew 授權通過
+    ES -> DB : findOrderWithPetDetails(query)
+    DB --> ES : Order Entity (含 Pet 疫苗紀錄, status)
+    
+    ' 狀態防呆檢查
+    alt #MistyRose 訂單非 CONFIRMED 狀態
+        ES --> UI : Error 400: "訂單狀態不符 (可能尚未付款或已報到)"
+    else #LightYellow 疫苗過期檢查
+        ES -> ES : checkVaccineValid(pet.vaccineDate, today)
+        alt 疫苗已過期
+            ES --> UI : Warning: "疫苗紀錄過期，需人工確認或補件"
+        else 疫苗有效
+            ES --> UI : 顯示訂單與可用實體房間 (Room) 列表
+        end
+    end
+end
+deactivate ES
+
+== 2. 分配實體房間與狀態移轉 (Transaction) ==
+R -> UI : 確認寵物狀況，分配房間 (roomId)
+UI -> ES : confirmCheckIn(orderId, roomId, staffId, JWT)
+activate ES
+
+ES -> Cache : validateToken(JWT)
+Cache --> ES : Valid
+
+' 業界標準：實體資源分配必須加鎖
+ES -> DB : **START TRANSACTION**
+
+' 嘗試鎖定房間，避免兩個店員安排到同一間
+ES -> DB : lockRoomIfAvailable(roomId)\n[UPDATE Room SET status='OCCUPIED' WHERE id=roomId AND status='AVAILABLE']
+DB --> ES : affectedRows
+
+alt #MistyRose 房間鎖定失敗 (剛好被同事選走)
+    ES -> DB : **ROLLBACK**
+    ES --> UI : Error 409: "該房間剛被分配，請重選"
+else #HoneyDew 房間鎖定成功
+    ' 狀態機推進
+    ES -> DB : updateOrderStatus(orderId, 'IN_PROGRESS')
+    
+    ' 留下營運稽核紀錄 (Audit Log)
+    ES -> DB : createCheckInLog(orderId, roomId, staffId, timestamp)
+    
+    ES -> DB : **COMMIT**
+    
+    ' 異步通知飼主
+    ES -> NS : dispatchNotice(memberId, "毛孩已順利入住/開始服務！")
+    
+    ES --> UI : 報到成功，列印房門標籤與實體收據
+end
+
+deactivate ES
+@enduml
+
+@startuml
+!theme plain
+autonumber
+
+actor "Receptionist" as R
+boundary "Staff UI" as UI
+control "ExecutionService\n(店務服務)" as ES
+participant "Redis (Auth)" as Cache
+control "BookingService\n(預約核心)" as BS
+database "SystemDB" as DB
+
+== 1. 現場查詢可用時段 ==
+R -> UI : 點擊 [現場散客登記]
+UI -> ES : getImmediateSlots(type, JWT)
+ES -> Cache : validateToken(JWT, role='STAFF')
+Cache --> ES : Valid
+
+' 業界標準：DRY 原則，複用預約模組的查詢邏輯
+ES -> BS : 內部呼叫: findAvailableSlots(today)
+BS -> DB : findSlots(status='AVAILABLE')
+DB --> BS : List<Timeslot>
+BS --> ES : slots
+ES --> UI : 顯示當下可安插的時段
+
+== 2. 現場收銀與強制鎖定 (內部協作) ==
+R -> UI : 收取現金，點擊 [確認排入並結帳]
+UI -> ES : createWalkInBooking(slotId, petId, payment='CASH', JWT)
+activate ES
+
+ES -> Cache : validateToken(JWT)
+Cache --> ES : {staffId, Valid}
+
+' 業界標準：啟動事務，並委託專業的 BookingService 進行原子鎖定
+ES -> DB : **START TRANSACTION**
+
+ES -> BS : 內部呼叫: attemptLock(walkInUserId, slotId)
+activate BS
+BS -> DB : updateStatusToLocked(slotId)\n[WHERE status='AVAILABLE' OR lockedUntil < now]
+DB --> BS : affectedRows
+BS --> ES : lockResult (成功/失敗)
+deactivate BS
+
+alt #MistyRose 鎖定失敗 (就在這一秒被線上客戶搶走)
+    ES -> DB : **ROLLBACK**
+    ES --> UI : Error 409: "抱歉，該時段剛被線上客戶預約，請重整畫面"
+else #HoneyDew 鎖定成功
+    ' 散客專屬邏輯：直接跳過 PENDING，寫入已付款並永久占用
+    ES -> DB : createBooking(status='CONFIRMED', type='WALK_IN')
+    ES -> DB : createPaymentRecord(method='CASH', staffId)
+    ES -> DB : updateTimeslot(status='OCCUPIED')
+    
+    ES -> DB : **COMMIT**
+    ES --> UI : 下單成功，列印紙本收據
+end
+deactivate ES
+@enduml
+
+@startuml
+!theme plain
+autonumber
+
+actor "Groomer" as G
+boundary "Groomer App" as UI
+control "TaskService" as TS
+participant "Redis (Auth)" as Cache
+participant "Cloud Storage\n(AWS S3)" as S3
+database "TaskDB" as DB
+control "NotificationService" as NS
+
+== 1. 任務啟動與狀態推進 ==
+G -> UI : 點擊 [開始美容]
+UI -> TS : startTask(taskId, JWT)
+activate TS
+
+' 業界標準：權限校驗
+TS -> Cache : validateToken(JWT, role='GROOMER')
+Cache --> TS : {staffId, Valid}
+
+' 業界標準：狀態機原子更新 (防併發)
+TS -> DB : updateStatus(taskId, 'IN_PROGRESS', startTime=now)\n[WHERE id=taskId AND status='ASSIGNED' AND groomerId=staffId]
+activate DB
+DB --> TS : affectedRows (1=成功, 0=失敗)
+deactivate DB
+
+alt #HoneyDew 更新成功
+    TS --> UI : 任務狀態轉換為「進行中」
+else #MistyRose 更新失敗 (狀態不符或非本人任務)
+    TS --> UI : Error 409: "任務狀態錯誤或無權限操作"
+end
+deactivate TS
+
+== 2. 過程記錄 (雲端圖片存證) ==
+G -> UI : 拍攝並上傳「美容前/後」照片
+UI -> TS : uploadPhoto(taskId, imageFile, type, JWT)
+activate TS
+
+TS -> Cache : validateToken(JWT)
+Cache --> TS : Valid
+
+' 業界標準：將大型檔案交給雲端物件儲存
+TS -> S3 : **uploadFile(imageFile)**
+activate S3
+S3 --> TS : **imageUrl (例如: https://s3.../photo.jpg)**
+deactivate S3
+
+' 資料庫只負責存輕量級的 URL 字串
+TS -> DB : savePhotoRecord(taskId, imageUrl, type)
+TS --> UI : 照片上傳成功
+deactivate TS
+
+== 3. 完工與異步通知連動 ==
+G -> UI : 點擊 [完工結案]
+UI -> TS : completeTask(taskId, JWT)
+activate TS
+
+TS -> Cache : validateToken(JWT)
+Cache --> TS : Valid
+
+' 狀態推進與時間戳記結算
+TS -> DB : updateStatus(taskId, 'COMPLETED', endTime=now)\n[WHERE id=taskId AND status='IN_PROGRESS']
+DB --> TS : success
+
+' --- 關鍵：內部 Service 解耦協作 ---
+TS ->> NS : **[Async] dispatchNotice(memberId, "美容完成，請來接狗狗！")**
+note right: 使用非同步事件 (Event Driven)\n不阻塞美容師的操作畫面
+
+TS --> UI : 任務結案，返回首頁
+deactivate TS
+@enduml
+
+@startuml
+!theme plain
+autonumber
+
+actor "Caregiver" as C
+boundary "Caregiver App" as UI
+control "CareService" as CS
+participant "Redis (Auth)" as Cache
+database "SystemDB" as DB
+participant "Message Queue\n(Event Bus)" as MQ
+control "NotificationService" as NS
+
+== 1. 巡房初始化與防呆提示 ==
+C -> UI : 掃描籠位 QR Code (roomId)
+UI -> CS : getPetCareContext(roomId, JWT)
+activate CS
+
+' 業界標準：嚴格的存取控制
+CS -> Cache : validateToken(JWT, role='CAREGIVER')
+Cache --> CS : {staffId, Valid}
+
+' 聚合查詢：同時取得寵物基本資訊、特殊飲食備註與過往用藥紀錄
+CS -> DB : findCurrentResidentContext(roomId)
+DB --> CS : {petId, name, dietNote, activeMedications}
+
+CS --> UI : 顯示寵物卡片與照護重點提醒
+deactivate CS
+
+== 2. 紀錄填寫與不可變儲存 (Append-only) ==
+C -> UI : 勾選 [餵食/清理/給藥] 並輸入觀察筆記
+C -> UI : 若發現異常，勾選 [健康警告: 嘔吐/血便]
+UI -> CS : submitCareLog(petId, logs, isAbnormal, JWT)
+activate CS
+
+CS -> Cache : validateToken(JWT)
+Cache --> CS : {staffId, Valid}
+
+' 業界標準：保證資料寫入 (INSERT)，留下不可竄改的歷史軌跡
+CS -> DB : **START TRANSACTION**
+CS -> DB : insertCareLog(petId, staffId, logs, timestamp)
+DB --> CS : logId (新增成功)
+
+alt #MistyRose 偵測到異常 (isAbnormal == true)
+    ' 更改寵物的當前即時狀態
+    CS -> DB : updatePetHealthStatus(petId, 'NEEDS_ATTENTION')
+    
+    ' --- 關鍵：解決連鎖失效的非同步架構 ---
+    ' 將通知事件丟進 Message Queue 就結束，不等待簡訊發送結果
+    CS ->> MQ : **publishEvent("HealthAlert", {petId, logId, staffId})**
+    note right: 非同步事件發布 (Event-Driven)\n確保日誌寫入不會被外部 API 拖垮
+end
+
+CS -> DB : **COMMIT**
+CS --> UI : 日誌已安全儲存
+deactivate CS
+
+== 3. 背景異常處理 (系統自驅動) ==
+' NotificationService 是 Message Queue 的訂閱者
+MQ ->> NS : [Async] onHealthAlertEvent(payload)
+activate NS
+NS -> DB : getManagerContact()
+NS -> NS : dispatchSMS("緊急：籠位 101 發現健康異常，請經理介入！")
+deactivate NS
+
+@enduml
+
+@startuml
+!theme plain
+autonumber
+
+actor "Member / Manager" as U
+boundary "System UI" as UI
+control "CancellationService" as CS
+participant "Redis (Auth)" as Cache
+database "SystemDB" as DB
+participant "Payment Gateway" as PG
+participant "Message Queue" as MQ
+
+== 1. 權限校驗與狀態防護 ==
+U -> UI : 點擊 [取消預約]
+UI -> CS : requestCancellation(bookingId, JWT)
+activate CS
+
+CS -> Cache : validateToken(JWT)
+Cache --> CS : {userId, role}
+
+' 業界標準：防併發鎖定
+CS -> DB : **START TRANSACTION**
+CS -> DB : lockBooking(bookingId)\n[SELECT ... FOR UPDATE]
+DB --> CS : Booking Entity (status, amount, startTime)
+
+alt #MistyRose 狀態不允許 (例如已報到、已取消)
+    CS -> DB : **ROLLBACK**
+    CS --> UI : Error 400: "目前狀態無法取消"
+else #HoneyDew 允許取消
+
+    == 2. 規則計算與退款意圖 (Refund Intent) ==
+    CS -> CS : calculateRefund(startTime, now)
+    note right: 策略模式：>24h 退 100%\n12h~24h 退 50%\n<12h 退 0%
+
+    alt #LightYellow 需執行退款 (RefundAmount > 0)
+        ' 業界標準：千萬不要在 Transaction 內呼叫外部 API
+        ' 先寫入 PENDING 紀錄，然後立刻 Commit 釋放鎖！
+        CS -> DB : insertRefundRecord(bookingId, amount, status='PENDING')
+        DB --> CS : refundId
+        CS -> DB : **COMMIT** == 3. 外部金流呼叫 (解鎖狀態下執行) ==
+        CS -> PG : executeRefund(refundId, amount)
+        activate PG
+        PG --> CS : refundResult (Success / Fail)
+        deactivate PG
+
+        ' 再次開啟 Transaction 更新結果
+        CS -> DB : **START TRANSACTION**
+        alt #HoneyDew 退款成功
+            CS -> DB : updateRefundRecord(refundId, 'SUCCESS')
+            CS -> DB : updateBookingStatus(bookingId, 'CANCELLED_WITH_REFUND')
+        else #MistyRose 退款失敗 (如餘額不足/斷線)
+            CS -> DB : updateRefundRecord(refundId, 'FAILED')
+            CS -> DB : updateBookingStatus(bookingId, 'MANUAL_REVIEW_NEEDED')
+            note right: 發生異常，凍結訂單與資源，\n交由財務人工介入
+            CS -> DB : **COMMIT**
+            CS --> UI : Error 500: "退款處理異常，已轉交客服處理"
+            return
+        end
+        
+    else #GhostWhite 不予退款 (RefundAmount = 0)
+        CS -> DB : updateBookingStatus(bookingId, 'CANCELLED_NO_REFUND')
+    end
+
+    == 4. 資源釋放與非同步通知 ==
+    ' 將時段還給市場
+    CS -> DB : updateTimeslot(slotId, 'AVAILABLE')
+    CS -> DB : **COMMIT**
+
+    ' 延續 SD-06 的好習慣：非同步解耦通知
+    CS ->> MQ : **publishEvent("BookingCancelled", {bookingId})**
+    
+    CS --> UI : 取消流程處理完畢
+end
+deactivate CS
+@enduml
+
+@startuml
+!theme plain
+autonumber
+
+actor "Manager" as M
+boundary "Management UI" as UI
+control "ScheduleService" as SS
+participant "Redis (Auth)" as Cache
+database "SystemDB" as DB
+participant "Message Queue\n(Event Bus)" as MQ
+
+== 1. 發起異動與衝突掃描 ==
+M -> UI : 選擇員工與新排班時間 (例如: 請假)
+UI -> SS : checkScheduleConflict(staffId, newSchedule, JWT)
+activate SS
+
+SS -> Cache : validateToken(JWT, role='MANAGER')
+Cache --> SS : Valid
+
+' 查詢該員工在異動區間內是否有已預約的訂單
+SS -> DB : findActiveBookings(staffId, timeRange)
+DB --> SS : List<Booking> (衝突名單)
+
+alt #MistyRose 偵測到預約衝突
+    SS --> UI : 回傳衝突列表 (包含受影響的訂單 ID)
+    UI --> M : 顯示警告：「此異動將影響 3 筆預約，是否強制取消？」
+    
+    alt #Salmon 確認強制變更
+        M -> UI : 點擊 [確認變更並發動批量取消]
+        UI -> SS : forceUpdateSchedule(staffId, newSchedule, affectedBookingIds, JWT)
+        
+        SS -> DB : **START TRANSACTION**
+        
+        ' 業界標準：鎖定排班資源，防止執行中被插入新訂單
+        SS -> DB : lockStaffSchedule(staffId)\n[SELECT ... FOR UPDATE]
+        
+        ' 1. 寫入新排班
+        SS -> DB : updateStaffSchedule(staffId, newSchedule)
+        ' 2. 將受影響的訂單狀態暫時標記為「系統取消中」
+        SS -> DB : bulkUpdateBookingStatus(affectedBookingIds, 'CANCELLING')
+        
+        SS -> DB : **COMMIT**
+        
+        ' 業界標準：解耦耗時操作，將災難丟給背景處理
+        SS ->> MQ : **publishEvent("MassCancellation", {bookingIds, reason="員工請假"})**
+        note right: 打包成一個事件交給 MQ，\n不阻塞當前的 API 回應
+        
+        SS --> UI : 變更成功，系統正於背景處理客戶退款與通知
+        
+    else #GhostWhite 放棄變更
+        M -> UI : 點擊 [取消動作]
+        UI --> M : 維持原排班
+    end
+    
+else #HoneyDew 無衝突
+    M -> UI : 點擊 [確認變更]
+    UI -> SS : updateSchedule(staffId, newSchedule, JWT)
+    SS -> DB : updateStaffSchedule()
+    SS --> UI : 排班更新成功
+end
+deactivate SS
+
+== 2. 背景非同步批次處理 (Worker) ==
+' 這裡串接 SD-07 的退款邏輯
+MQ ->> "CancellationWorker" : [Async] 接收 MassCancellation 事件
+activate "CancellationWorker"
+note over "CancellationWorker": 背景程式開始 Loop 處理這批名單，\n每處理一筆就呼叫一次 SD-07 的退款邏輯，\n完全不影響前台經理的操作順暢度。
+deactivate "CancellationWorker"
+
+@enduml
+
+@startuml
+!theme plain
+autonumber
+
+actor "Manager" as M
+boundary "Admin UI" as UI
+control "ReportService" as RS
+participant "Redis (Auth & Cache)" as Cache
+database "Read-Replica DB\n(OLAP 分析庫)" as DB
+
+== 1. 權限驗證與快取攔截 ==
+M -> UI : 設定報表條件 (例: 上個月營收分析)
+UI -> RS : generateRevenueReport(criteria, JWT)
+activate RS
+
+' 業界標準：嚴格的高階權限檢查
+RS -> Cache : validateToken(JWT, role='MANAGER')
+Cache --> RS : Valid
+
+' 業界標準：歷史報表快取機制 (Cache Aside)
+RS -> RS : isHistoricalPeriod(criteria)
+alt #LightYellow 查詢已結束的歷史月份
+    RS -> Cache : get(cacheKey="Report:2026-03")
+    Cache --> RS : CachedReportData
+    
+    alt #HoneyDew 快取命中 (Cache Hit)
+        RS --> UI : Return CachedReportData
+        return 顯示可視化圖表 (提早結束流程)
+    end
+end
+
+== 2. 讀寫分離的跨表數據聚合 ==
+' 業界標準：使用 Read-Replica DB 進行龐大查詢，保護主資料庫不被拖垮
+par 併發查詢以加速 I/O
+    RS -> DB : 查詢該區間內【已完成】訂單金額
+    RS -> DB : 查詢該區間內【已核准】退款紀錄
+    RS -> DB : 查詢員工【工時紀錄】與【完工數量】
+end
+DB --> RS : 訂單明細, 退款明細, 任務數據
+
+== 3. 內部運算與回傳 ==
+RS -> RS : calculateNetRevenue() \n(Total Sales - Refunds)
+RS -> RS : calculateStaffEfficiency() \n(Revenue / Total Hours)
+
+' 將結果打包成 DTO (Data Transfer Object)
+RS -> RS : buildReportDTO()
+
+alt 查詢為歷史區間 (將結果存入快取)
+    RS -> Cache : set(cacheKey, ReportDTO, TTL=30 days)
+end
+
+RS --> UI : Return ReportDTO
+UI -> UI : 將資料綁定至 Chart.js / D3 進行渲染
+UI --> M : 顯示動態可視化報表
+deactivate RS
+@enduml
+
+@startuml
+!theme plain
+autonumber
+
+actor "Receptionist / Member" as A
+boundary "Management UI" as UI
+control "MemberService" as MS
+participant "Redis (Auth & OTP)" as Cache
+database "SystemDB" as DB
+control "NotificationService" as NS
+
+== 1. 合併意圖與擁有權驗證 (Security Check) ==
+A -> UI : 查詢訪客資料 (輸入手機或 GuestID)
+UI -> MS : initiateGuestMerge(guestPhone, JWT)
+activate MS
+
+' 業界標準：店員身分驗證
+MS -> Cache : validateToken(JWT, role='STAFF')
+Cache --> MS : Valid
+
+MS -> DB : findGuestByPhone(guestPhone)
+DB --> MS : Guest Entity (包含原留存之手機號碼)
+
+' 業界標準：發送 OTP 驗證客人身分，防止盜取他人資料
+MS -> MS : generateOTP()
+MS -> Cache : storeOTP(guestPhone, OTP, TTL=5m)
+MS -> NS : sendSMS(guestPhone, "您的註冊驗證碼為 8573")
+MS --> UI : 提示：「已發送驗證碼至訪客手機，請輸入以確認本人授權」
+
+A -> UI : 輸入客人的 OTP 與新會員註冊資料
+UI -> MS : confirmMerge(guestPhone, OTP, newMemberProfile, JWT)
+
+MS -> Cache : verifyOTP(guestPhone, OTP)
+alt #MistyRose 驗證碼錯誤或過期
+    MS --> UI : Error 401: "驗證碼無效，拒絕合併資料"
+else #HoneyDew OTP 驗證通過
+
+    == 2. 資料合規遷移與軟刪除 (Transaction) ==
+    MS -> DB : findMemberByEmail(newMemberProfile.email)
+    
+    alt #MistyRose Email 已存在
+        MS --> UI : Error 409: "該 Email 已註冊，請引導登入"
+    else #HoneyDew 可建立新帳號
+        
+        MS -> DB : **START TRANSACTION**
+        
+        ' 1. 建立正式會員
+        MS -> DB : createMember(newMemberProfile)
+        DB --> MS : newMemberId
+        
+        ' 2. 批量重新綁定關聯資料 (將 OwnerID 從 Guest 換成 Member)
+        par 批量更新關聯表
+            MS -> DB : updatePetsOwner(from=guestId, to=newMemberId)
+            MS -> DB : updateOrdersOwner(from=guestId, to=newMemberId)
+        end
+        
+        ' 3. 業界標準：軟刪除與歷史追蹤 (Soft Delete & Audit Pointer)
+        MS -> DB : markGuestAsMerged(guestId, newMemberId)\n[UPDATE Guest SET status='MERGED', merged_to=newMemberId]
+        
+        MS -> DB : **COMMIT**
+        
+        ' 異步發送歡迎信
+        MS ->> NS : [Async] sendWelcomeEmail(newMemberId)
+        
+        MS --> UI : 資料轉移成功，已正式升級為會員
+    end
+end
+deactivate MS
+@enduml

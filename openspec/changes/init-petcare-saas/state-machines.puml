@@ -1,0 +1,801 @@
+@startuml
+!theme plain
+
+title State Machine: Booking (預約訂單)
+
+note as GlobalNote
+  Terminal States: EXPIRED / NO_SHOW / COMPLETED / REFUNDED
+  可退款: CANCELLED → REFUNDED
+  不可退款: EXPIRED / NO_SHOW / CANCELLED(免退款條款)
+end note
+
+[*] --> PENDING : 建立預約單\n鎖定時段 TTL=15min (SD-01)
+
+PENDING : 等待付款中\n時段狀態 = LOCKED
+CONFIRMED : 訂單成立\n時段狀態 = BOOKED
+EXPIRED : 無金流影響\n時段自動釋放
+ACTIVE : 寵物已入店\n服務進行中
+NO_SHOW : 訂金不退\n記錄 feeCharged
+CANCELLED : 預約已取消\n等待退款判斷
+REFUNDED : 含 PARTIAL / FULL 兩種子情境\n詳見 Refund 狀態機
+
+PENDING --> CONFIRMED : 付款授權成功 (SD-02)\n或現場收銀 (SD-04)
+PENDING --> EXPIRED : [CacheManager] TTL 到期\n自動釋放時段 → AVAILABLE
+
+CONFIRMED --> MODIFIED : 客戶申請更改日期/服務
+MODIFIED --> CONFIRMED : 新時段鎖定成功 (SD-08 衝突檢查通過)
+MODIFIED --> CANCELLED : 無可用新時段
+
+CONFIRMED --> ACTIVE : 實體櫃台報到成功 (SD-03)
+CONFIRMED --> NO_SHOW : [系統排程] 預約時間+30min 仍未報到\n自動標記，訂金不退
+CONFIRMED --> CANCELLED : 客戶或經理發起取消 (SD-07)
+
+ACTIVE --> CANCELLED : [Manager 授權] 特殊情況強制取消\n退款比例由 CancellationService 計算
+ACTIVE --> COMPLETED : 服務完畢，客戶接回
+
+CANCELLED --> REFUNDED : 退款流程完成\n(Refund 實體非同步更新)
+
+CANCELLED --> [*] : 無需退款之取消\n(免退款條款或 NO_SHOW)
+EXPIRED --> [*]
+NO_SHOW --> [*]
+COMPLETED --> [*]
+REFUNDED --> [*]
+
+@enduml
+
+@startuml
+!theme plain
+
+title State Machine: Refund (退款交易)
+
+note as GlobalNote
+  Terminal States: COMPLETED / CANCELLED / REJECTED
+  核心防禦機制:
+  1. idempotencyKey 防止重複退款
+  2. TimeoutScheduler 防止 Webhook 永久卡死
+  3. RetryScheduler + Exponential Backoff 防偶發中斷
+  4. MANUAL_REVIEW 保證業務流程不死結
+end note
+
+[*] --> PENDING : [CancellationService] Booking → CANCELLED\n自動建立退款單\nrefundAmount 由 CancellationService 計算
+
+PENDING : 等待非同步排程接手\nrefundAmount 已計算並鎖定\n(與 Booking 狀態解耦)
+
+PROCESSING : 處理中，等待金流端回應\n[防護] 帶唯一 idempotencyKey 防重複扣款
+
+FAILED : 自動退款失敗\n檢查 retry_count
+
+MANUAL_REVIEW : 需人工介入審核\n(聯絡客戶索取匯款帳戶 / 線下協商)
+
+state CANCELLED {
+  note "退款申請撤回\nBooking 維持 CANCELLED 狀態" as N_CAN
+}
+
+state REJECTED {
+  note "退款終止\n保留爭議紀錄供稽核" as N_REJ
+}
+
+state COMPLETED {
+  note "資金已退還 (自動或人工)\n含 FULL / PARTIAL 兩種子情境\n實際金額見 refundAmount 欄位" as N_COMP
+}
+
+PENDING --> PROCESSING : [PaymentWorker] 排程掃描\n向金流網關發起退款 API (SD-07)
+PENDING --> CANCELLED : [Manager] 申請無效\n或客戶主動撤回
+
+PROCESSING --> COMPLETED : [Webhook] 金流端「退款成功」通知\n發送 Event → Booking 轉 REFUNDED\n觸發 NotificationService 通知客戶
+PROCESSING --> FAILED : [Webhook] 金流拒絕\n(餘額不足/卡片失效)
+PROCESSING --> FAILED : [TimeoutScheduler] 超過 24h 未收到 Webhook\n自動轉入重試流程
+
+FAILED --> PROCESSING : [RetryScheduler] retry_count < 3\n指數退避重試 (Exponential Backoff)
+FAILED --> MANUAL_REVIEW : [System] retry_count >= 3\n通知經理(Slack) + 通知客戶「處理中請稍候」
+
+MANUAL_REVIEW --> REJECTED : [Manager] 審核不予退款\n(違反合約 / 客戶爭議)
+MANUAL_REVIEW --> COMPLETED : [Manager] 完成線下匯款\n手動標記 + NotificationService 通知客戶
+
+CANCELLED --> [*]
+REJECTED --> [*]
+COMPLETED --> [*]
+
+@enduml
+
+@startuml
+!theme plain
+skinparam state {
+  BackgroundColor<<Terminal>>  #EAEAEA
+  BackgroundColor<<Exception>> #FDF2F2
+  BorderColor<<Exception>>     #E02424
+  BackgroundColor<<Security>>  #FEF08A
+  BorderColor<<Security>>      #A16207
+}
+
+title State Machine: Identity/User（客戶帳號與身分）
+
+[*] --> UNVERIFIED : [Customer] 註冊帳號\nEntry: 建立 User 實體 (isVerified=false)\nAction: 發送 OTP
+
+[*] --> ACTIVE : [Customer] 第三方 OAuth 登入 (LINE/Google)\nEntry: isVerified=true，綁定 ThirdPartyToken\nNote: 跳過 UNVERIFIED 流程
+
+UNVERIFIED : 帳號已建立，等待驗證\n允許登入但功能受限\n無法建立 Booking\nOTP 有效期: 15min
+
+UNVERIFIED --> ACTIVE      : [Customer] 成功輸入 OTP\nAction: isVerified=true\nAction: 簽發 JWT Token
+UNVERIFIED --> OTP_EXPIRED : [Scheduler] 15min 未完成驗證\nAction: OTP 失效
+UNVERIFIED --> DEACTIVATED <<Terminal>> : [Scheduler] 註冊後超過 30 天未驗證\nAction: 去識別化 & 釋放 Email/Phone
+
+OTP_EXPIRED : OTP 已失效\n等待重新發送
+
+OTP_EXPIRED --> UNVERIFIED    : [Customer] 重新發送驗證碼\nGuard: 24h 內重送次數 < 5\nAction: 產生新 OTP，舊 OTP 作廢
+OTP_EXPIRED --> BLOCKED_TEMP  : [System] 24h 內重送 >= 5 次\nAction: 暫時封鎖，防 OTP 轟炸
+
+BLOCKED_TEMP --> UNVERIFIED : [Scheduler] 24h 後自動解除封鎖
+
+ACTIVE : 正常會員狀態\n允許建立 Booking 與上傳 VaccineRecord
+
+ACTIVE --> PASSWORD_RESET : [Customer] 忘記密碼\nAction: 發送重設連結（有效期 30min）\nAction: 現有 JWT Token 失效
+
+PASSWORD_RESET --> ACTIVE : [Customer] 完成重設\nAction: 簽發新 JWT Token
+PASSWORD_RESET --> ACTIVE : [Scheduler] 30min 逾期\nAction: 連結失效，舊密碼恢復效力
+
+ACTIVE --> BLACKLISTED <<Security>> : [System] NO_SHOW >= 3\n或 [Manager] 標記惡意客訴/棄養\nAction: 撤銷 JWT Token，API 403\nAction: 檢查現有 CONFIRMED Booking\n→ Manager 人工決定保留或取消
+
+state BLACKLISTED <<Security>> {
+  note "黑名單（奧客防禦）\n前端登入後僅可查歷史紀錄\n禁止線上建立新 Booking\n保留實體 Walk-in 權利（Manager 現場裁決）" as N_BLK
+}
+
+BLACKLISTED --> ACTIVE : [Manager] 顧客親自到店說明/補繳欠款\nAction: 重置 NO_SHOW 計數器
+BLACKLISTED --> DEACTIVATED <<Terminal>> : [Customer] 發起帳號刪除申請
+
+ACTIVE --> DEACTIVATED <<Terminal>> : [Customer] 帳號刪除申請（個資法）\n或 [Manager] 手動註銷
+
+ACTIVE --> MERGED <<Terminal>> : [Admin] 偵測重複帳號，執行合併\nAction: 保留主帳號，資料遷移\nAction: 副帳號標記 MERGED（軟刪除）
+
+state PASSWORD_RESET {
+  note "重設連結有效期 30min\n現有 Token 已失效\n逾期自動恢復舊密碼效力" as N_PWD
+}
+
+state DEACTIVATED <<Terminal>> {
+  note "軟刪除 (Soft Delete)\n去識別化時機:\n  立即: 遮蔽 Email/Phone\n  30天後: Hash 剩餘 PII\n保留 FK 關聯 (Booking/Incident)\n供財報與法務稽核" as N_DEACT
+}
+
+state MERGED <<Terminal>> {
+  note "帳號已合併至主帳號\n資料已遷移，軟刪除保留\n不影響歷史 FK 完整性" as N_MERGED
+}
+
+DEACTIVATED --> [*]
+MERGED      --> [*]
+
+note as Guardrails
+  技術指令:
+  1. 個資法合規 (GDPR/PDPA):
+     DEACTIVATED 禁止 DB DELETE
+     立即遮蔽 Email/Phone
+     30天後 Hash 剩餘 PII
+  2. 黑名單自動防禦:
+     監聽 Booking NO_SHOW 事件
+     計數器達標自動轉 BLACKLISTED
+     保護 Timeslot 與 Groomer 資源
+  3. OTP 防轟炸:
+     24h 內重送上限 5 次
+     超限暫封 24h
+  4. 驗證空窗期清理:
+     30 天未驗證 → DEACTIVATED
+     釋放 Email/Phone Unique Constraint
+  5. BLACKLISTED 現有 Booking 處理:
+     Manager 人工決定保留或取消
+     不自動強制取消，避免客訴
+end note
+
+@enduml
+
+@startuml
+!theme plain
+skinparam state {
+  BackgroundColor<<Terminal>>  #EAEAEA
+  BackgroundColor<<Exception>> #FDF2F2
+  BorderColor<<Exception>>     #E02424
+  BackgroundColor<<SLA>>       #FFFBEB
+  BorderColor<<SLA>>           #D97706
+}
+
+title State Machine: Incident (異常通報與危機處理)
+
+[*] --> REPORTED : [Groomer/Caregiver] 標記異常 (SD-06)\nEntry: 記錄 severityLevel & 綁定 TaskId/PetId\nAction: NotificationService 緊急推播至 Manager
+
+REPORTED : 異常已立案，等待介入\nSLA 紅線: 15min
+
+REPORTED --> UNACKNOWLEDGED_ALERT <<SLA>> : [Scheduler] 超過 15min 未處理\nAction: 升級警報（全店廣播）
+REPORTED --> INVESTIGATING : [Manager] 接手處理\nGuard: severityLevel == LOW/MEDIUM\nAction: 記錄 ackTime & 綁定 handlerId
+REPORTED --> ESCALATED : [Manager] 直接判定重大\nGuard: severityLevel == CRITICAL\nAction: 強制中止 ServiceTask → ABORTED
+
+UNACKNOWLEDGED_ALERT --> INVESTIGATING : [Manager] 緊急接手
+UNACKNOWLEDGED_ALERT --> CRITICAL_ESCALATION : [Scheduler] 再等 10min 仍無人接手\nAction: 自動致電店長/緊急聯絡人
+
+CRITICAL_ESCALATION --> INVESTIGATING : [店長] 接手處理
+
+INVESTIGATING : 負責人現場了解狀況\n(拍照存證/評估是否需送醫)
+
+INVESTIGATING --> DISMISSED <<Terminal>> : [Manager] 判定誤報\nAction: Task 解除異常鎖定，恢復原流程
+INVESTIGATING --> RESOLVED <<Terminal>> : [Manager] 輕微異常現場排除\nGuard: resolutionNote 已填寫\nAction: Task → GROOMING_ACTIVE\nAction: 通知 Groomer 可繼續作業
+INVESTIGATING --> ESCALATED <<Exception>> : [Manager] 判定嚴重事故\nAction: 強制中止 ServiceTask → ABORTED\nAction: NotificationService 緊急聯絡飼主
+
+state ESCALATED <<Exception>> {
+  [*] --> MEDICAL_ATTENTION
+  
+  MEDICAL_ATTENTION : 等待獸醫診斷
+  MEDICAL_ATTENTION --> MEDICAL_ATTENTION : [Scheduler] 30min 未取得診斷\n提醒 Manager 追蹤
+  MEDICAL_ATTENTION --> OWNER_NEGOTIATION : [Manager] 取得診斷證明\nAction: 上傳 S3
+  
+  OWNER_NEGOTIATION : 與飼主協商補償方案
+  OWNER_NEGOTIATION --> SETTLEMENT_REACHED : [Manager] 飼主同意和解
+  OWNER_NEGOTIATION --> LEGAL_DISPUTE : [Manager] 飼主拒絕\nAction: 通知律師/保險公司
+  
+  LEGAL_DISPUTE --> SETTLEMENT_REACHED : [法務] 法律途徑達成和解
+  
+  SETTLEMENT_REACHED --> CLOSED <<Terminal>> : Guard: S3 文件齊全\n(診斷書 + 和解簽名單)\nAction: 寫入 Immutable Audit Log\nAction: Pet.medicalHistory 更新
+}
+
+state DISMISSED <<Terminal>> {
+  note "誤報撤銷\n不影響系統與營運" as N_DIS
+}
+
+state RESOLVED <<Terminal>> {
+  note "輕微異常已排除\n任務繼續執行\nGroomer 已通知" as N_RES
+}
+
+state CLOSED <<Terminal>> {
+  note "重大事故歸檔\n保留完整醫療與和解紀錄\n供未來法務稽核\nPet.medicalHistory 已更新" as N_CLO
+}
+
+DISMISSED --> [*]
+RESOLVED --> [*]
+CLOSED --> [*]
+
+note as Guardrails
+  架構師技術指令 (v1.1):
+  1. 生命週期解耦: Incident 壽命大於 Task
+     Task ABORTED 後 Incident 仍須走到 CLOSED
+  2. 責任歸屬: INVESTIGATING 強制綁定 handlerId
+  3. 證據保全: CLOSED 前 Guard 強制 S3 文件齊全
+  4. SLA 雙重監控:
+     - 第一紅線: REPORTED 後 15min → UNACKNOWLEDGED_ALERT
+     - 第二紅線: 再 10min → CRITICAL_ESCALATION 自動致電
+  5. severityLevel 路徑分流:
+     LOW/MEDIUM → INVESTIGATING
+     CRITICAL   → 直接 ESCALATED
+end note
+
+@enduml
+
+@startuml
+!theme plain
+skinparam state {
+  BackgroundColor<<Terminal>>  #EAEAEA
+  BackgroundColor<<Exception>> #FDF2F2
+  BorderColor<<Exception>>     #E02424
+}
+
+title State Machine: Notification（通知發送機制）
+
+[*] --> PENDING : [System/Service] 觸發通知 Event\nEntry: 建立 Notification 實體\n  retryCount = 0\nAction: 渲染樣板 (Template Rendering)
+
+PENDING : 佇列中等待發送\n渠道: Line / Push / SMS / Email\n[V1: 主渠道失敗即 DEAD_LETTER]\n[V2: 自動 Fallback 次要渠道]
+
+PENDING --> SENDING : [NotificationWorker] 從 Message Queue 取出\nAction: 呼叫第三方 API (Twilio/SendGrid/Line)
+PENDING --> EXPIRED <<Terminal>> : [Scheduler] 通知已超過有效期限\n(時效性通知超過預約/事件時間)\nAction: 直接作廢，不再發送
+
+SENDING : 傳輸至第三方供應商中\n等待同步或非同步 Webhook 回應
+
+SENDING --> DELIVERED : [API/Webhook] 供應商回傳接收成功\nAction: 記錄 providerMessageId
+SENDING --> FAILED <<Exception>> : [API/Webhook] 供應商回傳失敗\n(號碼錯誤 / 憑證失效 / 連線逾時)
+SENDING --> FAILED <<Exception>> : [TimeoutScheduler] 超過 5min 未收到回應\nAction: 視為 Soft Bounce
+
+FAILED : 發送失敗\n檢查 retryCount 與錯誤類型
+
+FAILED --> PENDING : [RetryScheduler] Soft Bounce 重試\nGuard: retryCount < 3\n  AND errorType IN (TIMEOUT, HTTP_5XX)\nAction: retryCount + 1\nAction: 指數退避 (Exponential Backoff)
+
+FAILED --> DEAD_LETTER <<Terminal>> : [System] Hard Bounce\n(HTTP 400 / 無效號碼 / 使用者封鎖)\n或 retryCount >= 3（重試耗盡）\nAction: 記錄 failureReason
+
+state DELIVERED {
+  note "已送達客戶設備或信箱\nV1: 生命週期終點\nV2: 可繼續追蹤 READ 狀態" as N_DEL
+}
+
+DELIVERED --> READ <<Terminal>> : [V2] [ClientApp/Pixel] 使用者已讀/點擊\nAction: 記錄 readAt 時間戳記
+DELIVERED --> [*] : [V1 MVP 終點]
+
+state READ <<Terminal>> {
+  note "已讀確認 (V2 功能)\n供行銷漏斗或客訴爭議佐證" as N_READ
+}
+
+state EXPIRED <<Terminal>> {
+  note "時效性通知已過期\n直接作廢，不佔用 API 配額" as N_EXP
+}
+
+state DEAD_LETTER <<Terminal>> {
+  note "發送永久失敗 (Dead Letter Queue)\n重要通知升級人工處理:\n- 退款結果通知\n- 預約取消通知\n- 疫苗過期警告\n一般行銷通知直接作廢" as N_DLQ
+}
+
+READ        --> [*]
+EXPIRED     --> [*]
+DEAD_LETTER --> [*]
+
+note as Guardrails
+  技術指令:
+  1. 非同步解耦 (Critical):
+     業務服務只產生 Event
+     NotificationWorker 接手 PENDING
+     主業務流程絕不等待第三方 API
+  2. 冪等性防護:
+     重試呼叫帶唯一 idempotencyKey
+     防止網路波動導致重複發送
+  3. 錯誤分流 (Hard vs Soft Bounce):
+     Soft (HTTP 5XX / Timeout) → RetryScheduler
+     Hard (HTTP 400 / 封鎖)    →直接 DEAD_LETTER
+  4. retryCount 初始值 = 0
+     最多重試 3 次（retryCount 0→1→2→3）
+     第 3 次失敗後 retryCount=3 → DEAD_LETTER
+  5. SENDING 超時保護:
+     5min 未收到 Webhook → 強制轉 FAILED
+  6. MVP範疇:
+     V1: DELIVERED 為終點，時效過期人工處理
+     V2: READ 追蹤 / Fallback 渠道 / EXPIRED 自動作廢
+end note
+
+@enduml
+
+@startuml
+!theme plain
+skinparam state {
+  BackgroundColor<<Terminal>>  #EAEAEA
+  BackgroundColor<<Exception>> #FDF2F2
+  BorderColor<<Exception>>     #E02424
+  BackgroundColor<<SOP>>       #F0F9FF
+  BorderColor<<SOP>>           #0369A1
+}
+
+title State Machine: Room (實體房間 / 籠位)
+
+[*] --> AVAILABLE : [System] 建立房間實體檔案\n或 [Manager] 啟用空間
+
+AVAILABLE : 乾淨且閒置，可供分配
+
+AVAILABLE --> RESERVED    : [BookingService] 當日排程分配\nGuard: Booking 尚未取消\nAction: 預先綁定 BookingId（防碰撞鎖）
+AVAILABLE --> OCCUPIED    : [FrontDesk] Walk-in 散客直入 (SD-04)\nAction: 依 roomType 自動分配最適空籠\nAction: 建立臨時 BookingId 綁定\nAction: 記錄 checkInTime
+AVAILABLE --> MAINTENANCE : [Manager/Staff] 發現設備損壞
+
+RESERVED : 已被特定訂單預定\n實體空間仍為空
+
+RESERVED --> AVAILABLE    : [CancellationService] 客戶取消 / NO_SHOW\nAction: 解除 BookingId 綁定
+RESERVED --> OCCUPIED     : [FrontDesk] 實體報到 Check-in (SD-03)\nGuard: 報到寵物需與綁定 BookingId 吻合\nAction: 記錄 checkInTime
+RESERVED --> MAINTENANCE  : [Manager] 突發設備故障\nAction: BookingService 尋找替代 Room\n替代成功 → Booking 改綁新 Room\n替代失敗 → 通知客戶協商改期或取消
+
+OCCUPIED : 寵物實體使用中\n絕對互斥（DB 悲觀鎖）
+
+OCCUPIED --> CLEANING : [FrontDesk] 正常退房\nGuard: 飼主已到場確認\nAction: 記錄 checkOutTime\nAction: 解除 BookingId 綁定
+
+OCCUPIED --> CLEANING : [Groomer] 移出美容\nGuard: ServiceTask.status == ASSIGNED\nAction: 記錄移出時間\nAction: 通知 Caregiver 準備清潔
+
+state CLEANING <<SOP>> {
+  note "衛生防護防線\n未經授權無法強制轉為 AVAILABLE\n系統硬性阻擋 OCCUPIED 直接→AVAILABLE" as N_CLEAN
+}
+
+CLEANING --> CLEANING     : [Scheduler] 超過 30min 未完成\n發送提醒通知 Manager（最多 3 次）
+CLEANING --> AVAILABLE    : [Staff] 清潔完成\nAction: 寫入 AuditLog\n  {staffId, cleanStartTime, cleanEndTime}
+CLEANING --> MAINTENANCE  : [Manager] 清潔中發現損壞\n需進一步維修
+
+MAINTENANCE : 空間封鎖維修中\n需填寫 estimatedFixTime\n禁止任何預定與入駐
+
+MAINTENANCE --> MAINTENANCE : [Scheduler] 超過 estimatedFixTime\n發送逾期提醒給 Manager
+MAINTENANCE --> AVAILABLE   : [Manager] 維修完成並驗收
+MAINTENANCE --> DEACTIVATED <<Terminal>> : [Manager] 空間永久報廢 / 拆除
+MAINTENANCE --> ARCHIVED <<Terminal>>    : [Manager] 季度業務縮編封存
+
+state DEACTIVATED <<Terminal>> {
+  note "實體空間消滅\n不再參與任何排程分配" as N_DEACT
+}
+
+state ARCHIVED <<Terminal>> {
+  note "空間永久封存（非損壞）\n歷史使用率資料保留供報表分析" as N_ARCH
+}
+
+DEACTIVATED --> [*]
+ARCHIVED    --> [*]
+
+note as Guardrails
+  技術約束與架構指令:
+  1. 物理互斥鎖: OCCUPIED 狀態下 DB 加悲觀鎖
+     杜絕「一籠兩狗」的致命失誤
+  2. 衛生強制 SOP: OCCUPIED 只能→CLEANING
+     系統硬性阻擋直接轉 AVAILABLE
+  3. 故障容錯: RESERVED→MAINTENANCE 聯動
+     BookingService 自動尋找替代空籠
+     滿房則 Manager 介入協商
+  4. 清潔超時防護: 30min 未完成發提醒
+     防止房間永久卡在 CLEANING
+  5. MAINTENANCE 時間管理:
+     estimatedFixTime 強制填寫
+     逾期自動提醒 Manager
+end note
+
+@enduml
+
+@startuml
+!theme plain
+skinparam state {
+  BackgroundColor<<Terminal>>  #EAEAEA
+  BackgroundColor<<Exception>> #FDF2F2
+  BorderColor<<Exception>>     #E02424
+  BackgroundColor<<Transient>> #F0F9FF
+  BorderColor<<Transient>>     #0369A1
+}
+
+title State Machine: Schedule (員工排班)
+
+note as Guardrails
+  技術約束與架構指令 (SD-08 對齊):
+  1. 母子級聯: Schedule 變動對 Timeslot 擁有絕對覆蓋權
+  2. 瞬態保護: MODIFYING 強制所有修改必須經過 CONFLICT_CHECK
+  3. 破壞性稽核: CANCELLED_WITH_IMPACT 寫入 Immutable Audit Log
+     記錄授權 Manager ID + overrideReason
+  4. 未確認保護: PUBLISHED 到期標記 autoConfirmed=true
+     供人資部門事後審核
+end note
+
+[*] --> DRAFT : [Manager] 建立員工班表\nEntry: 初始化班表資料
+
+DRAFT : 編輯中（不對外開放）\n班表週期通常以週為單位\n尚未生成 Timeslot
+
+DRAFT --> PUBLISHED  : [Manager] 發布班表\nAction: 批次生成對應 Timeslot (AVAILABLE)
+DRAFT --> DISCARDED <<Terminal>> : [Manager] 放棄草稿\nAction: 刪除草稿，不生成任何 Timeslot
+
+PUBLISHED : 正式班表已生效\n系統已開放客戶預約
+
+PUBLISHED --> CONFIRMED  : [Staff] 確認班表\nAction: 記錄確認時間與 IP
+PUBLISHED --> MODIFYING <<Transient>> : [Manager/Staff] 發起修改或請假 (SD-08)
+PUBLISHED --> COMPLETED <<Terminal>> : [Scheduler] 班表時間已過期\n員工未確認標記 autoConfirmed=true
+
+CONFIRMED : 員工已確認排班\n出勤紀錄具完整法律效力
+
+CONFIRMED --> MODIFYING <<Transient>> : [Manager/Staff] 發起修改或請假 (SD-08)
+CONFIRMED --> COMPLETED <<Terminal>> : [Scheduler] 班表時間已過期
+
+state MODIFYING <<Transient>> {
+  [*] --> CONFLICT_CHECK
+
+  CONFLICT_CHECK : 系統檢查關聯 Timeslot 狀態
+
+  CONFLICT_CHECK --> NO_CONFLICT       : [System] 對應時段皆為 AVAILABLE/LOCKED\n尚無已付款 Booking
+  CONFLICT_CHECK --> CONFLICT_DETECTED : [System] 發現 BOOKED 時段\n已有確定預約的客戶
+
+  NO_CONFLICT : 無衝突，可直接套用
+
+  CONFLICT_DETECTED : 需人工介入決策\n觸發 SD-08 排班衝突預警
+  CONFLICT_DETECTED --> NO_CONFLICT : [Manager] 放棄修改\n維持原班表
+}
+
+MODIFYING --> PUBLISHED              : [System] 無衝突，自動套用變更\nAction: 同步更新/刪除關聯 Timeslot\nNote: 修改後重置為 PUBLISHED\n員工需重新確認新班表
+MODIFYING --> CANCELLED_WITH_IMPACT <<Exception>> : [Manager] 強制執行 Force Override\n⚠️ 高危操作，需輸入 overrideReason
+
+state CANCELLED_WITH_IMPACT <<Exception>> {
+  note "強制改班導致既有預約取消\n強制記錄 overrideReason 供稽核" as N_CAN
+}
+
+CANCELLED_WITH_IMPACT --> PUBLISHED : Action: 關聯 Timeslot → BLOCKED\nAction: CancellationService 觸發 Booking 取消 & Refund\nAction: NotificationService 通知客戶與員工\nAction: 寫入 Immutable Audit Log (Manager ID + Reason)
+
+state DISCARDED <<Terminal>> {
+  note "草稿已放棄\n不影響任何 Timeslot" as N_DIS
+}
+
+state COMPLETED <<Terminal>> {
+  note "歷史班表\n作為計算員工出勤與薪資之基準\nautoConfirmed=true 者需人資審核" as N_COMP
+}
+
+DISCARDED --> [*]
+COMPLETED --> [*]
+
+@enduml
+
+@startuml
+!theme plain
+skinparam state {
+  BackgroundColor<<Terminal>>  #EAEAEA
+  BackgroundColor<<Exception>> #FDF2F2
+  BorderColor<<Exception>>     #E02424
+}
+
+title State Machine: ServiceTask (美容任務 / 實體作業 SOP)
+
+note as Guardrails
+  架構師技術指令 (v2.1):
+  1. 原子性: 狀態轉換包覆在 DB Transaction 內
+  2. 醫療合規: READY 節點強制攔截過期疫苗
+  3. 資源釋放: COMPLETED/CANCELLED/ABORTED 必須釋放 Groomer 排班鎖
+  4. SLA 監控: OVERDUE_FLAGGED 確保警告只發送一次，防通知轟炸
+  5. 稽核軌跡: 每條轉換寫入 AuditLog (Who/When/Action)
+end note
+
+[*] --> PENDING : [BookingService] event: BookingConfirmed\nEntry: 初始化任務紀錄 & 關聯 PetInfo
+
+PENDING : 等待資源指派
+
+PENDING --> ASSIGNED : [Manager/Algorithm] 指派美容師\nGuard: 美容師任務數 < MaxLimit\nAction: 鎖定排班 (SD-08)
+PENDING --> UNASSIGNED_ALERT : [Scheduler] 距服務時間 < 2h 仍未指派\n發送警告通知 Manager
+
+ASSIGNED : 任務已分派，等待寵物 Check-in
+
+ASSIGNED --> READY : [FrontDesk] 實體報到完成 (SD-03)\nGuard: Pet.vaccineValid==true\nAND HealthDeclaration.signed==true\nAction: 通知美容師「寵物已就緒」
+ASSIGNED --> CANCELLED : [BookingService] event: OrderCancelled\nAction: 釋放 Groomer 排班資源\nAction: 發送取消通知
+
+UNASSIGNED_ALERT --> ASSIGNED : [Manager] 緊急手動指派
+UNASSIGNED_ALERT --> CANCELLED : [Manager] 無法指派\nAction: 釋放 Timeslot\n通知客戶 & 觸發退款
+
+READY : 寵物已在店(待洗籠)\n等待美容師接手
+
+READY --> IN_PROGRESS : [Groomer] 點擊「開始任務」\nGuard: Groomer.status == AVAILABLE\nAction: 記錄 ActualStartTime\nAction: Groomer.status = BUSY
+READY --> UNASSIGNED_ALERT : [Scheduler] 等待超過 30min 未開始\n通知美容師與 Manager
+
+state IN_PROGRESS {
+  [*] --> GROOMING_BEFORE
+
+  GROOMING_BEFORE : Entry: 記錄 prepStartTime
+  
+  GROOMING_BEFORE --> GROOMING_ACTIVE : [S3] 上傳美容前照片\nGuard: 數量>=1 & 解析度檢核\nAction: 寫入 AuditLog\n[防護] 失敗自動重試 3 次
+
+  state GROOMING_ACTIVE {
+    GROOMING_ACTIVE : Entry: 記錄 groomStartTime
+    [*] --> PROCESSING
+    
+    PROCESSING --> INCIDENT_RAISED : [Groomer] 標記異常 (SD-06)\nAction: 建立 Incident 狀態機
+    INCIDENT_RAISED --> PROCESSING : [Manager] 確認可繼續，異常已記錄
+  }
+
+  GROOMING_ACTIVE --> OVERDUE_FLAGGED : [Scheduler] 耗時 > 預估+60min\n且首次觸發\nAction: 發送一次性警告給 Manager
+  GROOMING_ACTIVE --> GROOMING_AFTER : [Groomer] 施作完成
+
+  OVERDUE_FLAGGED --> GROOMING_AFTER : [Groomer] 施作完成 (遲到)
+
+  GROOMING_AFTER : Entry: 記錄 groomEndTime
+
+  GROOMING_AFTER --> QA_CHECK : [S3] 上傳美容後照片\nGuard: 數量>=1\nAction: 寫入 AuditLog
+
+  QA_CHECK : Entry: 記錄 qaStartTime
+
+  QA_CHECK --> GROOMING_AFTER : [System] 檢核失敗，退回補件
+  QA_CHECK --> [*] : [System] SOP 檢核通過
+}
+
+IN_PROGRESS --> COMPLETED : [System] SOP 檢核通過\nAction: 記錄 ActualEndTime\nAction: Groomer.status = AVAILABLE\nEvent → NotificationService (SD-05)\nEvent → ReportService (SD-09)
+IN_PROGRESS --> ABORTED <<Exception>> : [Manager] 嚴重事故 / Incident 判定終止\n或飼主緊急領回
+
+COMPLETED : 任務完成
+COMPLETED : Event → ReportService 累計產值
+COMPLETED : Groomer.status 已釋放
+
+state ABORTED <<Exception>> {
+  ABORTED : 非正常終止
+  ABORTED : Entry:
+  ABORTED : 1. 儲存進度快照
+  ABORTED : 2. 釋放 Groomer.status = AVAILABLE
+  ABORTED : 3. 觸發 Cancellation/Refund
+  ABORTED : 4. 通知 Manager & 客戶
+}
+
+COMPLETED --> [*]
+ABORTED --> [*]
+CANCELLED --> [*]
+
+@enduml
+
+@startuml
+!theme plain
+skinparam state {
+  BackgroundColor<<Terminal>>  #EAEAEA
+  BackgroundColor<<Exception>> #FDF2F2
+  BorderColor<<Exception>>     #E02424
+  BackgroundColor<<Security>>  #FEF08A
+  BorderColor<<Security>>      #A16207
+}
+
+title State Machine: StaffAccount（員工帳號與權限）
+
+[*] --> PENDING_ACTIVATION : [Manager/Admin] 新增員工檔案\nAction: 寫入基礎資料\nAction: 寄送一次性啟用連結 OTP
+
+PENDING_ACTIVATION : 帳號已建立，等待首次驗證\n[V1: 人工作廢] [V2: OTP 有效期 72h]
+
+PENDING_ACTIVATION --> ACTIVE : [Staff] 首次登入並設定密碼\nAction: 簽發初始 JWT Token (SD-00)
+PENDING_ACTIVATION --> EXPIRED_INVITE : [V2 Scheduler] 啟用連結超過 72h 未使用\n[V1 替代: Manager 手動作廢]\nAction: 連結失效，通知 Manager
+PENDING_ACTIVATION --> DEACTIVATED <<Terminal>> : [Manager] 建立錯誤或取消入職\nAction: 使啟用連結立即失效
+
+EXPIRED_INVITE --> PENDING_ACTIVATION : [Manager] 重新寄送啟用連結\nAction: 產生新 OTP，舊連結作廢
+
+ACTIVE : 帳號正常運作中\n允許操作 POS / Groomer App
+
+ACTIVE --> LOCKED <<Security>> : [AuthService] 連續密碼錯誤 >= 5 次\nAction: 寫入 Security AuditLog\nAction: 發送異常登入告警給 Admin
+
+ACTIVE --> PASSWORD_RESET <<Security>> : [Staff] 主動更改密碼\n或 [Admin] 強制重設\nAction: 現有 JWT Token 失效\nAction: 寄送重設連結（有效期 24h）
+
+ACTIVE --> SUSPENDED <<Exception>> : [Manager] 暫時停權\nGuard: 該員工不可有 IN_PROGRESS 狀態之任務\nAction: JWT Blacklist 更新\nAction: 凍結未來 Schedule 分配\n[V2: 設定 suspensionExpiryDate]
+
+ACTIVE --> ACTIVE : [Admin] 更新 role & permissions\nAction: 舊 JWT 失效，簽發新 Token
+
+ACTIVE --> DEACTIVATED <<Terminal>> : [Manager] 正常離職\nGuard: 該員工不可有 IN_PROGRESS 狀態之任務\n(防實體脫節 - Critical)\nAction: JWT Blacklist 更新\nAction: Event → ScheduleService 未來排班轉交 Manager
+
+state LOCKED <<Security>> {
+  note "觸發防禦機制\n拒絕任何登入嘗試\n冷卻期: 30min" as N_LOCK
+}
+
+LOCKED --> ACTIVE    : [Admin] 手動查核並解鎖\nAction: 完全重置錯誤計數器
+LOCKED --> ACTIVE    : [Scheduler] 冷卻期 30min 結束\nAction: 自動解鎖\nNote: 錯誤計數器保留\n再次觸發直接→SUSPENDED
+LOCKED --> SUSPENDED : [Admin] 判定惡意內部人員\nGuard: 不可有 IN_PROGRESS 之 ServiceTask\nAction: 強制停權 + 安全稽核報告
+
+state PASSWORD_RESET <<Security>> {
+  note "密碼重設中\n現有 Token 已失效\n重設連結有效期 24h" as N_PWD
+}
+
+PASSWORD_RESET --> ACTIVE    : [Staff] 完成密碼重設\nAction: 簽發新 JWT Token
+PASSWORD_RESET --> ACTIVE    : [Scheduler] 24h 未完成\n且由 Staff 主動申請\nAction: 連結失效，舊密碼恢復效力
+PASSWORD_RESET --> SUSPENDED : [Scheduler] 24h 未完成\n且由 Admin 強制重設（資安事件）\nAction: 轉入停權，需 Admin 介入審核
+
+state SUSPENDED <<Exception>> {
+  note "帳號暫停使用\nAPI Gateway → HTTP 403 Forbidden\n[V1: 人工復權]\n[V2: suspensionExpiryDate 到期自動復職]" as N_SUS
+}
+
+SUSPENDED --> ACTIVE       : [Manager] 解除停權復職\n[V2: 或 Scheduler suspensionExpiryDate 到期]
+SUSPENDED --> DEACTIVATED <<Terminal>> : [Manager] 確認解僱 / 離職生效
+
+state DEACTIVATED <<Terminal>> {
+  note "軟刪除 (Soft Delete)\n保留歷史關聯 (Task/Incident/Schedule)\n建議保留期限: 7 年（依勞基法）\n不再顯示於排班可用名單" as N_DEACT
+}
+
+DEACTIVATED --> [*]
+
+note right of ACTIVE
+  多裝置 Token 策略 (Option B - 單一登入):
+  新登入使舊 Token 立即失效
+  強制「認人不認機」
+  確保 AuditLog 追蹤絕對效力
+end note
+
+note as Guardrails
+  首席架構師修正指令 (v3-Final):
+  1. 實體脫節防護 (Critical):
+     ACTIVE/LOCKED → SUSPENDED 或 DEACTIVATED 前
+     強制 Guard: 不可有 IN_PROGRESS 之 ServiceTask
+     強迫經理先處理進行中任務再執行帳號異動
+  2. 逾期重設分流（降低維運成本）:
+     Staff 主動申請逾期 → 退回 ACTIVE（舊密碼繼續有效）
+     Admin 強制重設逾期 → 升級 SUSPENDED（資安事件處理）
+  3. 軟刪除鐵律:
+     離職絕不執行 DELETE，保護 FK 完整性
+  4. 漸進式安全懲罰:
+     自動解鎖保留錯誤計數器
+     防禦低頻暴力破解（每 30min 撞庫 4 次手法）
+  5. MVP V1/V2 範疇標注:
+     V1: OTP 無限期 / 停權人工復權 / 排程器僅用於核心交易
+     V2: 72h OTP 排程 / suspensionExpiryDate 自動復職
+end note
+
+@enduml
+
+@startuml
+!theme plain
+
+title State Machine: Timeslot (虛擬時段庫存)
+
+note as Guardrails
+  技術約束 (對齊 SD):
+  1. 防超賣 (SD-01): AVAILABLE→LOCKED 原子性保證
+  2. 散客直通 (SD-04): AVAILABLE 直接→BOOKED
+  3. 強制中斷 (SD-08): ScheduleService 最高權限
+     可將任何狀態強制轉向 BLOCKED
+  4. 歸檔策略 (SD-09): Scheduler 每日批次掃描
+     BOOKED+結案/NO_SHOW → COMPLETED
+     AVAILABLE+過期 → EXPIRED_AVAILABLE
+end note
+
+[*] --> AVAILABLE : [ScheduleService] 依據員工排班表自動生成
+
+AVAILABLE : 開放預約中\n前端可查詢此庫存
+LOCKED : 資源保留中\n對外顯示已被選取
+BOOKED : 庫存已正式扣減\n與一筆 Booking(CONFIRMED) 綁定
+BLOCKED : 時段停用\n子情境: LEAVE / MAINTENANCE\nLUNCH_BREAK / FORCE_OVERRIDE
+
+state COMPLETED {
+  note "歷史資料\n含 NO_SHOW 紀錄\n作為營運報表基礎 (SD-09)" as N_COMP
+}
+
+state EXPIRED_AVAILABLE {
+  note "從未被預約的過期時段\n不計入報表分母\n供排班效率分析" as N_EXP
+}
+
+AVAILABLE --> LOCKED : [BookingService] 客戶點選時段 (SD-01)\nGuard: Redis 原子性檢查無併發鎖\nAction: 寫入鎖定, TTL=15min
+AVAILABLE --> BOOKED : [POS_Service] 散客現場直接結帳 (SD-04)\nAction: 繞過 LOCKED, 直接扣減庫存
+AVAILABLE --> BLOCKED : [ScheduleService] 經理拉班表/員工請假 (SD-08)
+AVAILABLE --> EXPIRED_AVAILABLE : [Scheduler] 時段結束時間已過\n且從未被預約\nAction: 自動歸檔
+
+LOCKED --> AVAILABLE : [CacheManager] 15min TTL 到期\n或客戶主動釋放
+LOCKED --> BOOKED : [PaymentService] 金流授權成功 (SD-02)\nAction: 銷毀 Redis TTL, 持久化至 DB
+LOCKED --> BLOCKED : [ScheduleService] 經理強制拉班表 (SD-08)\nAction: 銷毀 Redis TTL\nAction: Booking → CANCELLED\nAction: 通知客戶「時段已取消，請重新選擇」
+
+BOOKED --> AVAILABLE : [CancellationService] 訂單取消 (SD-07)\nAction: 釋放庫存
+BOOKED --> BLOCKED : [ScheduleService] 經理強制覆蓋已有預約 (SD-08)\n⚠ 高衝突操作\nAction: 觸發 Booking 取消 & Refund 流程\nAction: NotificationService 通知受影響客戶
+BOOKED --> COMPLETED : [Scheduler] 每日 00:00 批次掃描\nGuard: Timeslot.endTime < now\nAND Booking.status IN (COMPLETED, NO_SHOW)\nAction: 歸檔為歷史資料\nnoShowFlag=true if NO_SHOW
+
+BLOCKED --> AVAILABLE : [ScheduleService] 經理恢復排班
+
+COMPLETED --> [*]
+EXPIRED_AVAILABLE --> [*]
+
+@enduml
+
+@startuml
+!theme plain
+skinparam state {
+  BackgroundColor<<Terminal>>  #EAEAEA
+  BackgroundColor<<Exception>> #FDF2F2
+  BorderColor<<Exception>>     #E02424
+  BackgroundColor<<Warning>>   #FFFBEB
+  BorderColor<<Warning>>       #D97706
+}
+
+title State Machine: VaccineRecord（疫苗記錄與醫療合規）
+
+note as Guardrails
+  跨邊界防護機制:
+  1. Immutable 原則:
+     紀錄不允許 UPDATE
+     只能走完生命週期被 REJECTED 或 SUPERSEDED
+  2. 審核時即分流（消除假合規窗口）:
+     expiryDate > now+30天 → VALID
+     now < expiryDate <= now+30天 → 直接 EXPIRING_SOON
+     expiryDate <= now → REJECTED（已過期文件）
+  3. VaccineExpiredEvent 跨服務連動:
+     BookingService 監聽事件
+     CONFIRMED Booking: 倒數 3 天後強制取消
+     ACTIVE Booking: 僅警告，動物已在店不強制取消
+  4. Pet.vaccineValid 單一真相來源:
+     VALID/EXPIRING_SOON = true
+     EXPIRED = false
+     由 VaccineRecord 狀態機統一維護
+end note
+
+[*] --> PENDING_VERIFICATION : [Customer/FrontDesk] 上傳疫苗證明\nEntry: 記錄上傳時間與 S3 文件路徑
+
+PENDING_VERIFICATION : 待人工審核（尚未具備合規效力）\n必要疫苗: DOG(狂犬病+犬五合一) / CAT(貓三合一)
+
+PENDING_VERIFICATION --> VALID : [Manager] 審核通過\nGuard: expiryDate > now + 30天\nAction: 寫入 expiryDate\nAction: Pet.vaccineValid = true
+
+PENDING_VERIFICATION --> EXPIRING_SOON <<Warning>> : [Manager] 審核通過\nGuard: now < expiryDate <= now + 30天\nAction: Pet.vaccineValid = true\nAction: 立即發送「即將過期」警告
+
+PENDING_VERIFICATION --> REJECTED <<Exception>> : [Manager] 審核退回\nGuard: 文件模糊 / 非必要疫苗 / expiryDate <= now\nAction: 通知客戶原因，建立新 VaccineRecord 重新上傳
+
+VALID : 醫療合規期內\nPet.vaccineValid = true\n允許 Booking 建立與實體 Check-in
+
+VALID --> EXPIRING_SOON <<Warning>> : [Scheduler] 每日批次掃描\nGuard: 距 expiryDate <= 30 天\nAction: 發送「準備更新」提醒
+
+VALID --> SUPERSEDED <<Terminal>> : [System] 該寵物新 VaccineRecord 審核通過\nAction: 舊紀錄提早退役
+
+state EXPIRING_SOON <<Warning>> {
+  note "即將過期，仍具合規效力\n前端亮黃燈警示" as N_WARN
+}
+
+EXPIRING_SOON --> EXPIRING_SOON : [Scheduler] 每 7 天重複提醒\n（最多 4 次，防通知轟炸）
+
+EXPIRING_SOON --> EXPIRED <<Terminal>> : [Scheduler] 每日批次掃描\nGuard: expiryDate < now\nAction: Pet.vaccineValid = false\nAction: 拋出 VaccineExpiredEvent
+
+EXPIRING_SOON --> SUPERSEDED <<Terminal>> : [System] 該寵物新 VaccineRecord 審核通過
+
+state REJECTED <<Exception>> {
+  note "無效文件，不影響原有合規狀態\n本紀錄永久保留為稽核軌跡\n客戶需重新建立全新 VaccineRecord" as N_REJ
+}
+
+state EXPIRED <<Terminal>> {
+  note "已過期失去效力\nPet.vaccineValid = false\nVaccineExpiredEvent 觸發鏈:\n  T+0: 通知客戶更新\n  T+7天前: 每日提醒\n  T-3天: 最後警告\n  T-3天仍未更新:\n    CONFIRMED Booking → 強制 CANCELLED + 退款\n    ACTIVE Booking（已在店）→ 僅警告，不強制取消" as N_EXP
+}
+
+state SUPERSEDED <<Terminal>> {
+  note "被新紀錄取代\n歷史醫療軌跡永久封存 (Read-only)\n不影響 Pet.vaccineValid（由新紀錄維護）" as N_SUP
+}
+
+REJECTED   --> [*]
+EXPIRED    --> [*]
+SUPERSEDED --> [*]
+
+@enduml

@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+/* 
+  PetCare SaaS Custom Theme Variables
+  在 Tailwind v4 中，我們可以直接使用 @theme 擴充主題
+*/
+@theme {
+  --font-sans: "Inter", "system-ui", "Segoe UI", "Roboto", "Helvetica Neue", "Arial", sans-serif;
+  
+  /* 
+    您可以在這裡擴充您專屬的色票
+    --color-brand-500: #eb7a53;
+  */
+}
+
+/* 確保整個應用程式填滿視窗，覆蓋 Vite 預設行為 */
+html, body, #root {
+  min-height: 100vh;
+  margin: 0;
+  padding: 0;
+  width: 100%;
+}
+
+/* Document Page Typography and Styling */
+.prose-doc h2 {
+  font-size: 1.5rem;
+  font-weight: 900;
+  color: #1c1917; /* stone-900 */
+  margin-top: 2rem;
+  margin-bottom: 1rem;
+}
+.prose-doc h3 {
+  font-size: 1.25rem;
+  font-weight: 800;
+  color: #1c1917;
+  margin-top: 1.5rem;
+  margin-bottom: 0.75rem;
+}
+.prose-doc p {
+  line-height: 1.75;
+  color: #57534e; /* stone-600 */
+  margin-bottom: 1.25rem;
+}
+.prose-doc ul {
+  list-style-type: disc;
+  padding-left: 1.5rem;
+  margin-bottom: 1.25rem;
+  color: #57534e;
+}
+.prose-doc li {
+  margin-bottom: 0.5rem;
+  line-height: 1.6;
+}
+.prose-doc strong {
+  color: #1c1917;
+  font-weight: 700;
+}

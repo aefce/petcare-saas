@@ -1,0 +1,173 @@
+@startuml ClassDiagram_Modular_Monolith
+!theme plain
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+skinparam nodesep 70
+skinparam ranksep 100
+skinparam packageStyle rectangle
+
+title PetCare SaaS - 模組化單體領域類別圖 (Domain Models)
+
+' ==========================================
+' 1. Identity & Access Domain (身分與權限模組)
+' ==========================================
+package "Identity Domain" #F8FAFC {
+    abstract class Account {
+        - accountId : UUID
+        - email : String
+        - passwordHash : String
+        - role : Enum(OWNER, ADMIN, STAFF)
+        - isActive : Boolean
+        + verifyPassword() : Boolean
+    }
+    
+    abstract class PetOwner {
+        - ownerId : UUID
+        - name : String
+        - phone : String
+    }
+    
+    class Member extends PetOwner {
+        - memberSince : Date
+        - loyaltyPoints : Integer
+    }
+    
+    class Guest extends PetOwner {
+        - tempExpiryDate : DateTime
+        + convertToMember() : Member
+    }
+    
+    class Staff {
+        - staffId : UUID
+        - department : String
+        - permissions : List<String>
+    }
+}
+
+' ==========================================
+' 2. Core Business Domain (預約與寵物模組)
+' ==========================================
+package "Booking & Pet Domain" #F0FDF4 {
+    class Pet {
+        - petId : UUID
+        - name : String
+        - species : Enum(DOG, CAT)
+        - weight : Float
+        - isAggressive : Boolean [UR-05]
+        - deletedAt : DateTime [UR-19 Soft Delete]
+        + validateVaccine() : Boolean
+    }
+
+    class Booking {
+        - bookingId : UUID
+        - status : Enum(PENDING, CONFIRMED, CANCELLED)
+        - lockedUntil : DateTime [UR-01 15m TTL]
+        - totalAmount : Integer
+        - createdAt : DateTime
+        + isExpired() : Boolean
+    }
+
+    class BookingItem {
+        - itemId : UUID
+        - itemType : Enum(BOARDING, GROOMING)
+        - priceAtBooking : Integer [UR-07 Price Snapshot]
+    }
+
+    class Room {
+        - roomId : UUID
+        - roomType : String
+        - isOccupied : Boolean
+    }
+
+    class Timeslot {
+        - slotId : UUID
+        - startTime : DateTime
+        - isLocked : Boolean
+    }
+}
+
+' ==========================================
+' 3. Payment & Ops Domain (營運與金流模組)
+' ==========================================
+package "Payment & Ops Domain" #FFFBEB {
+    class Order {
+        - orderId : UUID
+        - finalAmount : Integer
+        - status : Enum(UNPAID, PAID, REFUNDED)
+    }
+
+    class PaymentTransaction {
+        - transactionId : UUID
+        - idempotencyKey : String [UR-04]
+        - gatewayRefId : String
+        - amount : Integer
+        - status : Enum
+    }
+
+    class CheckInRecord {
+        - checkInId : UUID
+        - actualCheckIn : DateTime
+        - status : Enum
+    }
+
+    class ServiceTask {
+        - taskId : UUID
+        - status : Enum(PENDING, ONGOING, COMPLETED)
+        - workerNote : String
+    }
+    
+    class AuditLog {
+        - logId : UUID
+        - action : String
+        - entityId : UUID
+        - timestamp : DateTime [UR-12 Immutable]
+    }
+}
+
+' ==========================================
+' 4. Service Layer (介面與邏輯層)
+' ==========================================
+package "Service Layer (FastAPI Controllers)" #EFF6FF {
+    class BookingService <<Service>> {
+        + reserveResource(petId, time)
+        + confirmBooking(bookingId)
+    }
+    class PaymentService <<Service>> {
+        + processCheckout(orderId)
+        + handleRefund(orderId)
+    }
+    class ExecutionService <<Service>> {
+        + processCheckIn(orderId)
+        + updateTaskStatus(taskId)
+    }
+}
+
+' ==========================================
+' 關係定義 (Relationships)
+' ==========================================
+Account "1" -- "0..1" Member : 綁定 >
+Account "1" -- "0..1" Staff : 綁定 >
+
+PetOwner "1" --> "0..*" Pet : 擁有 >
+Member "1" --> "0..*" Booking : 發起 >
+
+Booking "1" *-- "1..*" BookingItem : 包含 >
+Booking "1" --> "1" Order : 產生 >
+
+BookingItem "0..*" --> "1" Pet : 服務對象 >
+BookingItem "0..*" --> "0..1" Room : 佔用房間 >
+BookingItem "0..*" --> "0..*" Timeslot : 佔用時段 >
+
+Order "1" *-- "0..*" PaymentTransaction : 交易紀錄 >
+Order "1" --> "0..1" CheckInRecord : 現場報到 >
+
+ServiceTask "0..*" --> "1" BookingItem : 對應項目 >
+ServiceTask "0..*" --> "1" Staff : 執行人員 >
+
+' 服務層相依性 (隱藏箭頭以保持乾淨)
+BookingService ..> Booking
+PaymentService ..> Order
+ExecutionService ..> ServiceTask
+ExecutionService ..> CheckInRecord
+
+@enduml

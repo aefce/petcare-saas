@@ -1,0 +1,204 @@
+@startuml
+!theme plain
+
+' ─── 核心排版與樣式設定 ───
+skinparam linetype ortho
+skinparam nodesep 50
+skinparam ranksep 60
+skinparam padding 5
+skinparam componentStyle uml2
+
+' 強制消滅預設的黃色註解，改為乾淨的白底灰框
+skinparam note {
+  BackgroundColor #FFFFFF
+  BorderColor     #94A3B8
+  FontColor       #333333
+}
+skinparam component {
+  BackgroundColor #FFFFFF
+  BorderColor     #3B82F6
+  ArrowColor      #64748B
+}
+skinparam interface {
+  BackgroundColor #DEFF9A
+  BorderColor     #65A30D
+}
+skinparam package {
+  BackgroundColor #F8FAFC
+  BorderColor     #CBD5E1
+}
+skinparam database {
+  BackgroundColor #F0FDF4
+  BorderColor     #22C55E
+}
+skinparam node {
+  BackgroundColor #FEF2F2
+  BorderColor     #EF4444
+}
+
+title Component Diagram: PetCare SaaS 微服務邏輯架構（完善版）
+
+' ─── 第一層：前端應用 ───
+package "Client Layer（前端應用層）" as L1 {
+  [Customer App]   as CustApp
+  [Staff App]      as StaffApp
+  [Manager Portal] as MgrPortal
+}
+
+' ─── 第二層：邊界與閘道 ───
+package "Edge & Gateway（邊界與閘道）" as L2 {
+  [CDN & WAF]   as WAF
+  [API Gateway] as APIGW
+  WAF -down-> APIGW : 淨化後流量
+
+  ' 改用浮動註解綁定，避免排版引擎報錯
+  note "防護範圍:\n1. DDoS 流量清洗\n2. SQL Injection 過濾\n3. 惡意爬蟲封鎖\n4. 地理位置限制" as NoteWAF
+  WAF .right. NoteWAF
+}
+
+' ─── 第三層：核心微服務 ───
+package "Core Microservices（核心業務微服務）" as L3 {
+  component "Identity Service"  as IdSVC {
+    note "管理帳號、權限\n與 Blacklist 黑名單" as N_Id
+  }
+  component "Booking Service"   as BookSVC {
+    note "管理 Booking 預約\n與 Timeslot 虛擬庫存" as N_Book
+  }
+  component "Execution Service" as ExecSVC {
+    note "管理 Room, ServiceTask\nIncident 異常與 VaccineRecord" as N_Exec
+  }
+  component "HR Service"        as HRSVC {
+    note "管理 Schedule（員工排班）\n與產值/抽成計算" as N_HR
+  }
+  component "Finance Service"   as FinSVC {
+    note "管理 Payment 支付\n與 Refund 退款" as N_Fin
+  }
+  component "Report Service"    as ReportSVC {
+    note "聚合 Order/Refund/ServiceTask\n產出營運月報與員工績效 (SD-09)" as N_Rep
+  }
+}
+
+' ─── 對外介面定義 ───
+interface "I_Auth_API"   as I_Auth
+interface "I_Book_API"   as I_Book
+interface "I_Exec_API"   as I_Exec
+interface "I_HR_API"     as I_HR
+interface "I_Fin_API"    as I_Fin
+interface "I_Report_API" as I_Rep
+
+IdSVC     -up- I_Auth
+BookSVC   -up- I_Book
+ExecSVC   -up- I_Exec
+HRSVC     -up- I_HR
+FinSVC    -up- I_Fin
+ReportSVC -up- I_Rep
+
+' ─── 第四層：基礎設施與排程 ───
+package "Infrastructure & Background（基礎設施與排程）" as L4 {
+  component "Job Scheduler\n（排程引擎）"    as Scheduler
+  component "Event Broker\n（訊息佇列）"    as EventBus
+  component "Dead Letter Queue\n（永久失敗訊息區）" as DLQ
+  component "Notification Service"          as NotifSVC
+  component "Centralized Logging\n（集中式日誌）"  as Logger
+
+  interface "Pub/Sub" as I_Event
+  EventBus -left- I_Event
+  EventBus -right-> DLQ : 重試耗盡的訊息\n轉入人工處理區
+}
+
+' ─── 第五層：資料與外部服務 ───
+package "Data & External（資料與外部服務）" as L5 {
+
+  database "Redis Cache" as Cache
+  
+  ' 改用浮動註解綁定
+  note "用途分區:\n1. JWT Blacklist（IdSVC）\n2. Timeslot 併發鎖 TTL（BookSVC）\n3. Notification 免打擾時段狀態\n4. OTP 暫存（15min TTL）" as NoteCache
+  Cache .right. NoteCache
+
+  database "Identity DB"     as DB_Id
+  database "Booking DB"      as DB_Book
+  database "Execution DB"    as DB_Exec
+  database "HR DB"           as DB_HR
+  database "Finance DB"      as DB_Fin
+  database "Notification DB" as DB_Notif
+  database "Report DB\n（Read Replica）" as DB_Rep
+
+  node "Payment Gateway\n（綠界/LINE Pay）"    as ExtPayment
+  node "AWS S3\n（照片/文件存儲）"             as ExtS3
+  node "Notification Provider\n（Twilio/FCM）" as ExtNotif
+}
+
+' ─── 強制分層排版 ───
+L1 -[hidden]down-> L2
+L2 -[hidden]down-> L3
+L3 -[hidden]down-> L4
+L4 -[hidden]down-> L5
+
+' ─── 流量進入路徑 ───
+CustApp   -down-> WAF : HTTPS
+StaffApp  -down-> WAF : HTTPS
+MgrPortal -down-> WAF : HTTPS
+
+APIGW -down-> I_Auth
+APIGW -down-> I_Book
+APIGW -down-> I_Exec
+APIGW -down-> I_HR
+APIGW -down-> I_Fin
+APIGW -down-> I_Rep
+
+' ─── 微服務同步呼叫 ───
+BookSVC   -down-> I_Auth : 查核黑名單與 Token
+BookSVC   -down-> I_HR   : 查詢排班庫存
+ExecSVC   -down-> I_Book : 檢核預約與重分房
+ExecSVC   -down-> I_Fin  : 觸發部分退款
+ExecSVC   -down-> I_HR   : 查詢並預留排班資源
+IdSVC     -down-> I_Exec : 停權前查核進行中任務
+
+' ─── 非同步事件發布 ───
+IdSVC     -down-> I_Event : 《publish》UserBlacklisted
+BookSVC   -down-> I_Event : 《publish》BookingConfirmed
+BookSVC   -down-> I_Event : 《publish》NoShowed
+ExecSVC   -down-> I_Event : 《publish》IncidentEscalated
+ExecSVC   -down-> I_Event : 《publish》VaccineExpired
+FinSVC    -down-> I_Event : 《publish》RefundFailed
+HRSVC     -down-> I_Event : 《publish》SchedulePublished
+
+' ─── 非同步事件訂閱 ───
+I_Event <.. NotifSVC  : 《subscribe》所有事件，觸發通知
+I_Event <.. BookSVC   : 《subscribe》Blacklist/VaccineExpired
+I_Event <.. IdSVC     : 《subscribe》NoShow 累加計數
+I_Event <.. ReportSVC : 《subscribe》TaskCompleted\nOrderCompleted
+
+' ─── 資料庫連線 ───
+IdSVC     -down-> DB_Id
+BookSVC   -down-> DB_Book
+ExecSVC   -down-> DB_Exec
+HRSVC     -down-> DB_HR
+FinSVC    -down-> DB_Fin
+NotifSVC  -down-> DB_Notif
+ReportSVC -down-> DB_Rep
+
+' ─── 快取連線 ───
+IdSVC   -down-> Cache : JWT 黑名單 / OTP 暫存
+BookSVC -down-> Cache : Timeslot 併發鎖 TTL
+
+' ─── 第三方服務 ───
+FinSVC   -down-> ExtPayment : 授權與退刷
+ExecSVC  -down-> ExtS3      : 美容照片/疫苗證明
+NotifSVC -down-> ExtNotif   : 信件與推播發送
+
+' ─── 排程引擎 ───
+Scheduler -up-> BookSVC  : TTL 清理與爽約處理
+Scheduler -up-> ExecSVC  : SLA 逾時警告
+Scheduler -up-> IdSVC    : OTP 過期與停權到期
+Scheduler -up-> FinSVC   : 退款重試排程
+Scheduler -up-> HRSVC    : 班表自動歸檔
+Scheduler -up-> NotifSVC : 免打擾時段喚醒
+
+' ─── 日誌收集 ───
+APIGW   -down-> Logger : Access Log
+IdSVC   -down-> Logger : 資安稽核日誌
+FinSVC  -down-> Logger : 金流稽核日誌
+ExecSVC -down-> Logger : Incident 稽核日誌
+
+@enduml

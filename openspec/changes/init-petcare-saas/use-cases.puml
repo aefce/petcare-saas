@@ -1,0 +1,110 @@
+@startuml
+title 寵物旅館與美容系統 (PetCare SaaS) - 綜合業務與系統使用案例圖
+left to right direction
+skinparam packageStyle rectangle
+skinparam actorStyle awesome
+skinparam usecaseStyle oval
+
+' ============ 參與者 (Actors) ============
+actor "Pet Owner\n(Abstract)" as PO
+actor "Guest\n(訪客)" as Guest
+actor "Member\n(會員)" as Member
+
+package "內部員工 (Internal Staff)" {
+    actor "Staff\n(Abstract)" as Staff
+    actor "Receptionist\n(櫃檯)" as Receptionist
+    actor "Caretaker\n(照護員)" as Caretaker
+    actor "Groomer\n(美容師)" as Groomer
+    actor "Admin\n(管理員)" as Admin
+}
+
+' 系統與外部 API
+actor "System\n(系統排程/背景)" as SYS <<System>>
+actor "Scanner\n(硬體掃描器)" as Scanner <<Hardware>>
+actor "Payment API\n(綠界/LINE Pay)" as PayAPI <<External>>
+
+' --- 角色繼承關係 ---
+Guest -up-|> PO
+Member -up-|> PO
+Receptionist -up-|> Staff
+Caretaker -up-|> Staff
+Groomer -up-|> Staff
+Admin -up-|> Staff
+
+rectangle "PetCare SaaS 核心系統" {
+
+    ' ============ 1. 帳號與身分 ============
+    package "1. 帳號與身分 (Identity)" {
+        usecase "客戶端登入/註冊" as UC_C_Auth
+        usecase "升級正式會員\n(繼承歷史資料)" as UC_Upgrade
+        usecase "後台 RBAC 登入" as UC_S_Auth
+    }
+
+    ' ============ 2. 預約與資源 ============
+    package "2. 預約與資源 (Booking & Resource)" {
+        usecase "預約美容/住宿服務" as UC_Book
+        usecase "取消預約" as UC_Cancel
+        usecase "現場實體客報到" as UC_WalkIn
+        usecase "15mins 資源鎖定 (TTL)" as UC_Lock
+        usecase "自動釋放資源" as UC_Release
+    }
+
+    ' ============ 3. 服務執行 ============
+    package "3. 服務執行 (Service Execution)" {
+        usecase "記錄日常照護/健康" as UC_CareRecord
+        usecase "執行美容任務與紀錄" as UC_GroomRecord
+        usecase "觸發行為風險警示 (Modal)" as UC_Alert
+    }
+
+    ' ============ 4. 金流與支付 ============
+    package "4. 金流與支付 (Payment)" {
+        usecase "處理訂單結帳\n(具備冪等性)" as UC_Checkout
+        usecase "處理違約金與退款" as UC_Refund
+        usecase "背景對帳與狀態校正" as UC_Sync
+    }
+
+    ' ============ 5. 管理與監控 ============
+    package "5. 管理與監控 (Admin & System)" {
+        usecase "管理價格與服務設定" as UC_ManageOps
+        usecase "查閱不可變稽核日誌\n(Audit Trail)" as UC_Audit
+        usecase "系統備份與還原" as UC_Backup
+    }
+
+    ' --- 關係連線 (Associations) ---
+    
+    ' 客戶端
+    PO -- UC_C_Auth
+    Guest -- UC_Upgrade
+    Member -- UC_Book
+    Member -- UC_Cancel
+
+    ' 員工端
+    Staff -- UC_S_Auth
+    Receptionist -- UC_WalkIn
+    Receptionist -- UC_Checkout
+    Scanner -- UC_WalkIn
+    Caretaker -- UC_CareRecord
+    Groomer -- UC_GroomRecord
+    Admin -- UC_ManageOps
+    Admin -- UC_Audit
+    Admin -- UC_Backup
+
+    ' 系統與外部
+    SYS -- UC_Lock
+    SYS -- UC_Release
+    SYS -- UC_Sync
+    UC_Checkout -- PayAPI
+    UC_Refund -- PayAPI
+
+    ' --- 依賴與擴展 (Include / Extend) ---
+    UC_Book ..> UC_Lock : <<include>>
+    UC_Book ..> UC_Checkout : <<include>>
+    UC_WalkIn ..> UC_Checkout : <<include>>
+    UC_Cancel ..> UC_Refund : <<include>>
+    UC_Cancel ..> UC_Release : <<include>>
+    
+    ' 當寵物掃描或紀錄時發現異常，觸發警示
+    UC_WalkIn <.. UC_Alert : <<extend>>
+    UC_CareRecord <.. UC_Alert : <<extend>>
+}
+@enduml
